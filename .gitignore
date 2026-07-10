@@ -1,0 +1,22 @@
+# Gradle / build outputs
+.gradle/
+build/
+app/build/
+*/build/
+
+# Machine-specific
+local.properties
+
+# Signing / secrets
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Note: app/libs/*.aar (RayNeo Mercury / IPC SDKs) ARE tracked — the app cannot build without them.
