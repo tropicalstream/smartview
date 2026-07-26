@@ -1312,6 +1312,29 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         val js = """
             (function(){
               if (window.__svPoly) return; window.__svPoly = true;
+              // Trusted Types: register a pass-through DEFAULT policy.
+              //
+              // Sites that send require-trusted-types-for 'script' (YouTube does)
+              // reject any bare string assigned to innerHTML. page-agent builds
+              // its panel that way, so on those sites it died at init with
+              // "This document requires 'TrustedHTML' assignment" — the agent
+              // was simply unusable on them. A default policy is the sanctioned
+              // escape hatch: the browser routes bare strings through it.
+              //
+              // This does relax a defence the page asked for, on pages the user
+              // has deliberately pointed their own agent at — the same trade
+              // already made by injecting page-agent at all. Kept narrow: it
+              // only forwards the string unchanged, and never runs if the page
+              // already installed its own default policy.
+              try{
+                if (window.trustedTypes && window.trustedTypes.createPolicy && !window.trustedTypes.defaultPolicy){
+                  window.trustedTypes.createPolicy('default', {
+                    createHTML: function(s){ return s; },
+                    createScript: function(s){ return s; },
+                    createScriptURL: function(s){ return s; }
+                  });
+                }
+              }catch(e){}
               function def(o,n,f){ try{ if(!o[n]) Object.defineProperty(o,n,{value:f,writable:true,configurable:true}); }catch(e){} }
               // Align JS-visible browser signals with the spoofed modern UA so
               // Cloudflare Turnstile doesn't detect an old/automated engine and loop.
