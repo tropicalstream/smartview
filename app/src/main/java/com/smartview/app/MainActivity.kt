@@ -831,8 +831,15 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             // blind spot we just fixed — it moves the document, so on a page whose
             // content is in an inner pane "go to the bottom" appeared to do nothing.
             // A single huge delta saturates whichever box actually scrolls.
-            "top", "scroll to top" -> { trace("scrollTop"); showStatus("⤒ Top", 1200); scrollPage(-2_000_000); return }
-            "bottom", "scroll to bottom" -> { trace("scrollBottom"); showStatus("⤓ Bottom", 1200); scrollPage(2_000_000); return }
+            // Cover how people actually SAY it. "go to the bottom" was reaching
+            // the LLM — a ~60s round trip and an agent step budget spent on a
+            // scroll the app can do instantly. Heard in testing, not guessed.
+            "top", "scroll to top", "scroll to the top", "go to the top", "go to top" ->
+                { trace("scrollTop"); showStatus("⤒ Top", 1200); scrollPage(-2_000_000); return }
+            "bottom", "scroll to bottom", "scroll to the bottom", "go to the bottom", "go to bottom" ->
+                { trace("scrollBottom"); showStatus("⤓ Bottom", 1200); scrollPage(2_000_000); return }
+            "page down" -> { trace("pageDown"); showStatus("↓", 900); scrollPage(760); return }
+            "page up" -> { trace("pageUp"); showStatus("↑", 900); scrollPage(-760); return }
             "help", "what can i say", "what can you do" -> { trace("help"); showHelp(); return }
         }
 
