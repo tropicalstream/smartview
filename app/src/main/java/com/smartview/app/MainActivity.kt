@@ -725,6 +725,163 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     }
 
     /**
+     * Search the page you are ON, using its own search box.
+     *
+     * "search for chiptunes" while standing on archive.org used to throw the
+     * user back to DuckDuckGo — the one place they had just navigated away
+     * from. On a site with its own index (an archive, a shop, a wiki) the
+     * site's search is the whole point of being there, and a web search is a
+     * strictly worse answer. Say "... on duckduckgo" to leave deliberately.
+     *
+     * Falls back to a web search when the page genuinely has no search field,
+     * so the command never simply does nothing.
+     */
+    private fun searchInPage(query: String) {
+        val js = """
+            (function(q){
+              function visible(el){
+                if (!el || el.disabled || el.readOnly) return false;
+                var r = el.getBoundingClientRect();
+                if (r.width < 60 || r.height < 12) return false;
+                var s = getComputedStyle(el);
+                return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+              }
+              // Score rather than accept/reject: a page often holds several
+              // text fields and the biggest is not always the right one.
+              // archive.org is the cautionary case — its Wayback URL bar is by
+              // far the largest input, so "search for chiptunes" went in there
+              // and looked up ARCHIVED SITES instead of searching the
+              // collection, returning a blogspot URL.
+              function scoreField(el){
+                if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return -99;
+                var t = (el.type || 'text').toLowerCase();
+                if (['hidden','password','checkbox','radio','file','submit','button','email','number'].indexOf(t) >= 0) return -99;
+                var hay = [el.name, el.id, el.placeholder, el.className,
+                           el.getAttribute('aria-label'), el.getAttribute('role'),
+                           el.getAttribute('title')].join(' ').toLowerCase();
+                // A URL/address lookup takes a location, not a query. Fatal, not
+                // a nudge: filling it navigates somewhere unrelated.
+                if (/\burl\b|\baddress\b|\bdomain\b|https?:|home page|web ?address/.test(hay)) return -99;
+                var s = 0;
+                if (t === 'search') s += 4;
+                if (/^(q|s|query|search|kw|term)${'$'}/.test((el.name || '').toLowerCase())) s += 4;
+                if (/search/.test(hay)) s += 3;
+                if (/query|find|keyword/.test(hay)) s += 2;
+                var f = el.form;
+                if (f && /search/i.test((f.getAttribute('role') || '') + ' ' + (f.action || '') + ' ' + (f.className || ''))) s += 2;
+                return s;
+              }
+              // Sites like archive.org put the search box inside a web component,
+              // where a plain querySelectorAll cannot see it.
+              function collect(root, out, depth){
+                if (!root || depth > 5) return;
+                var all;
+                try { all = root.querySelectorAll('input, textarea'); } catch(e){ return; }
+                for (var i = 0; i < all.length; i++) out.push(all[i]);
+                var hosts;
+                try { hosts = root.querySelectorAll('*'); } catch(e){ return; }
+                for (var j = 0; j < hosts.length; j++){
+                  if (hosts[j].shadowRoot) collect(hosts[j].shadowRoot, out, depth + 1);
+                }
+              }
+              function collect2(root, out, depth){
+                if (!root || depth > 5) return;
+                var all;
+                try { all = root.querySelectorAll('button, a, [role="button"], summary'); } catch(e){ return; }
+                for (var i = 0; i < all.length; i++) out.push(all[i]);
+                var hosts;
+                try { hosts = root.querySelectorAll('*'); } catch(e){ return; }
+                for (var j = 0; j < hosts.length; j++){
+                  if (hosts[j].shadowRoot) collect2(hosts[j].shadowRoot, out, depth + 1);
+                }
+              }
+              function bestField(){
+                var out = [];
+                collect(document, out, 0);
+                var scored = [];
+                for (var i = 0; i < out.length; i++){
+                  if (!visible(out[i])) continue;
+                  var sc = scoreField(out[i]);
+                  if (sc > 0) scored.push({el: out[i], s: sc});
+                }
+                if (!scored.length) return null;
+                // Highest score wins; size only breaks ties between equals.
+                scored.sort(function(a, b){
+                  if (b.s !== a.s) return b.s - a.s;
+                  return b.el.getBoundingClientRect().width - a.el.getBoundingClientRect().width;
+                });
+                return scored[0].el;
+              }
+              var el = bestField();
+              if (!el){
+                // Many sites keep the search box collapsed behind a magnifier
+                // until it is clicked — archive.org does. Reveal it, then let
+                // the caller retry once the DOM has settled.
+                var toggles = [];
+                collect2(document, toggles, 0);
+                for (var k = 0; k < toggles.length; k++){
+                  var b = toggles[k];
+                  var lbl = ((b.getAttribute('aria-label') || '') + ' ' + (b.title || '') +
+                             ' ' + (b.className || '') + ' ' + (b.id || '')).toLowerCase();
+                  if (/search/.test(lbl) && visible(b)){ try { b.click(); return 'opened'; } catch(e){} }
+                }
+                return 'none';
+              }
+              el.focus();
+              // Frameworks (React/Vue) track value through the prototype setter;
+              // assigning .value directly leaves their state stale and the field
+              // reverts on the next render.
+              try {
+                var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement : window.HTMLInputElement;
+                var setter = Object.getOwnPropertyDescriptor(proto.prototype, 'value').set;
+                setter.call(el, q);
+              } catch(e){ el.value = q; }
+              el.dispatchEvent(new Event('input',  {bubbles: true}));
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+              // Submit: the form if there is one, otherwise a real Enter press,
+              // which is what a custom search widget listens for.
+              var submitted = false;
+              if (el.form){
+                try { if (el.form.requestSubmit) { el.form.requestSubmit(); submitted = true; } } catch(e){}
+                if (!submitted){ try { el.form.submit(); submitted = true; } catch(e){} }
+              }
+              if (!submitted){
+                ['keydown','keypress','keyup'].forEach(function(type){
+                  el.dispatchEvent(new KeyboardEvent(type, {
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+                  }));
+                });
+              }
+              return 'ok';
+            })(${JSONObject.quote(query.trim())});
+        """.trimIndent()
+        webView.evaluateJavascript(js) { result ->
+            when {
+                result != null && result.contains("ok") -> {
+                    Log.d(TAG, "in-page search: $query")
+                    showStatus("🔎 " + query.trim() + " · on this site", 2500)
+                }
+                // The box was collapsed and we just clicked it open; give the
+                // page a moment to render it, then fill it in.
+                result != null && result.contains("opened") && !retriedOpen -> {
+                    retriedOpen = true
+                    Log.d(TAG, "revealed a collapsed search box; retrying")
+                    main.postDelayed({ searchInPage(query); retriedOpen = false }, 500)
+                }
+                else -> {
+                    // No search box here — a web search beats doing nothing.
+                    Log.d(TAG, "no search field on page; falling back to web search")
+                    retriedOpen = false
+                    runSearch(query, false)
+                }
+            }
+        }
+    }
+
+    /** Guards the reveal-then-fill retry so a stubborn page cannot loop. */
+    private var retriedOpen = false
+
+    /**
      * The commands a short utterance is allowed to be "nearly".
      *
      * Every entry is something the grammar above already handles exactly; this
@@ -933,8 +1090,15 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 RegexOption.IGNORE_CASE
             ).containsMatchIn(q)
             if (!wantsAction) {
-                trace("searchBare:$q")
-                runSearch(q, false)
+                // Search the page you are ON. Naming an engine ("... on
+                // duckduckgo", handled above) is how you ask to leave the site;
+                // a bare "search for chiptunes" on archive.org means archive's
+                // search, not a jump back to the page you just left. Falls back
+                // to the web when the page has no search box of its own — and
+                // on DuckDuckGo's own home page this simply drives its search
+                // field, so the common case is unchanged.
+                trace("searchInPage:$q")
+                searchInPage(q)
                 return
             }
             trace("searchIsTask:$q")   // falls through to the agent below
