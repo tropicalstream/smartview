@@ -47,22 +47,38 @@ class BookmarkStore(context: Context) {
     fun deleteByUrl(url: String) = save(all().filter { it.url != url })
 
     /** Score bookmarks by keyword overlap with the spoken words; null if weak. */
-    fun bestMatch(spoken: String): Bookmark? {
+    /**
+     * @param minScore raise for the BARE-utterance path. An explicit
+     *   "open <x>" can trust a 3-point match, but a whole spoken sentence
+     *   accumulates stray +1s and used to teleport the user to a bookmark
+     *   mid-sentence — which also destroys the injected page-agent. Observed:
+     *   "summarise the news article on this page" matched a Hacker News
+     *   bookmark purely on "new" appearing inside "news".
+     * @param requireExact bare path additionally demands at least one WHOLE
+     *   keyword hit, so accumulation alone can never navigate.
+     */
+    fun bestMatch(spoken: String, minScore: Int = 3, requireExact: Boolean = false): Bookmark? {
         val words = tokenize(spoken)
         if (words.isEmpty()) return null
         var best: Bookmark? = null
         var bestScore = 0
+        var bestExact = false
         for (bm in all()) {
             var score = 0
+            var exact = false
             for (kw in bm.keywords) {
                 for (w in words) {
-                    if (kw == w) score += 3
-                    else if (kw.contains(w) || w.contains(kw)) score += 1
+                    if (kw == w) { score += 3; exact = true }
+                    // Short substrings are noise, not evidence: "new" inside
+                    // "news" scored the same as a real partial match.
+                    else if (w.length >= 5 && (kw.contains(w) || w.contains(kw))) score += 1
                 }
             }
-            if (score > bestScore) { bestScore = score; best = bm }
+            if (score > bestScore) { bestScore = score; best = bm; bestExact = exact }
         }
-        return if (bestScore >= 3) best else null
+        if (bestScore < minScore) return null
+        if (requireExact && !bestExact) return null
+        return best
     }
 
     private fun save(list: List<Bookmark>) {

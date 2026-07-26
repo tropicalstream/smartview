@@ -19,6 +19,8 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -159,7 +161,16 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             )
             logicalClickHandler = { x, y -> handleLogicalClick(x, y) }
             edgeScrollHandler = { dy -> scrollPage(dy) }
-            leftEdgeBackHandler = { if (dimMode) exitDim() else goBack() }
+            // Ordered so the gesture always undoes the most recent thing. Before
+            // this, reaching for A/Z/Caps/Clear at the keyboard's left edge went
+            // BACK and discarded whatever had been typed.
+            leftEdgeBackHandler = {
+                when {
+                    dimMode -> exitDim()
+                    keyboardContainer.visibility == View.VISIBLE -> hideKeyboard()
+                    else -> goBack()
+                }
+            }
             rightEdgePullHandler = { if (!dimMode) enterDim() }
             contentInteractionBlocked = { dimMode || keyboardContainer.visibility == View.VISIBLE }
             doubleTapHandler = { onDoubleTap() }
@@ -218,17 +229,40 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         disableSystemKeyboard(wv)
         wv.addJavascriptInterface(SvBridge(), "SvBridge")
 
+        AdBlock.warmUp(this)
+        // Service-worker requests never reach WebViewClient, so a page with a SW
+        // (most large sites) would otherwise fetch its ads straight past the
+        // filter. Route them through the same check.
+        runCatching {
+            android.webkit.ServiceWorkerController.getInstance().setServiceWorkerClient(
+                object : android.webkit.ServiceWorkerClient() {
+                    override fun shouldInterceptRequest(
+                        request: WebResourceRequest
+                    ): WebResourceResponse? = AdBlock.intercept(request)
+                }
+            )
+        }
+
         wv.webChromeClient = WebChromeClient()
         wv.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView?, request: WebResourceRequest?
+            ): WebResourceResponse? = AdBlock.intercept(request)
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 injectPolyfills()
+                AdBlock.resetCount()
                 if (url == null || !url.startsWith(INTERNAL_BASE)) injectDarkMode()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 injectPolyfills()
+                // Mirrors the internal-page guard used for dark mode: the
+                // settings page is ours and must never be filtered.
+                if (url == null || !url.startsWith(INTERNAL_BASE)) injectCosmeticFilter()
+                Log.d(TAG, "adblock: ${AdBlock.blockCount()} requests blocked on ${url?.take(60)}")
                 injectKeyboardSupport()
                 if (url != null && !url.startsWith(INTERNAL_BASE)) { injectDarkMode(); injectPageAgent() }
                 CookieManager.getInstance().flush()
@@ -265,7 +299,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         hideKeyboard()
         dimOverlay.visibility = View.VISIBLE
         dimOverlay.bringToFront()
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // KEEP_SCREEN_ON is owned by onCreate for the whole session. Touching it
+        // here is what caused the display to sleep mid-article: exitDim used to
+        // CLEAR the flag onCreate had set, so one dim/undim cycle silently
+        // disabled keep-awake for the rest of the run.
         binocular.invalidate()
     }
 
@@ -273,7 +310,6 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         if (!dimMode) return
         dimMode = false
         dimOverlay.visibility = View.GONE
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         showStatus("Display on", 1200)
         binocular.invalidate()
     }
@@ -298,7 +334,12 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
     /** Triple-tap → open the bookmarks / Settings page. */
     private fun onTripleTap() {
-        if (dimMode) return
+        // Second way out of dim. The left-edge pull is the only other exit, and
+        // it means traversing the full width blind with the cursor hidden under
+        // the overlay. Deliberately triple and not double: two stray brushes of
+        // the temple pad while adjusting the glasses would flash a lit display
+        // into the wearer's eyes.
+        if (dimMode) { exitDim(); return }
         GroqSpeech.stopSpeaking()
         if (recorder.isRecording) {
             main.removeCallbacks(autoStopRecording)
@@ -399,14 +440,75 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         webView.loadUrl(url)
     }
 
+    /**
+     * Spoken help. Without this, "help" was shipped to the LLM as a browsing
+     * task — the one word a confused user is most likely to say was also the
+     * one guaranteed not to help them.
+     */
+    private fun showHelp() {
+        val lines = listOf(
+            "Double-tap to speak · triple-tap for bookmarks",
+            "\"search <anything>\" · \"bookmark this\" · \"open <name>\"",
+            "\"go back\" · \"scroll down\" · \"refresh\" · \"go home\"",
+            "Anything else is handled by the page agent",
+            "Pull the left edge to go back · right edge to go dark"
+        )
+        showStatus(lines.joinToString("  ·  "), 9000)
+        GroqSpeech.speak(
+            this,
+            "Double tap to speak. Say search, bookmark this, or open a bookmark by name. " +
+                "Anything else I hand to the page agent."
+        ) {}
+    }
+
+    /**
+     * Normalise a transcript for GRAMMAR MATCHING only.
+     *
+     * Whisper punctuates freely, and interior punctuation used to defeat the
+     * grammar outright: "on duckduckgo" came back as "on duckduck, go", the
+     * engine group failed, and the entire sentence — verb and all — became the
+     * search query. Observed live.
+     *
+     * Deliberately a targeted punctuation class and NOT [^a-z0-9' ]: the latter
+     * deletes every non-ASCII character and shreds any non-English query.
+     */
+    private fun normalizeCommand(raw: String): String =
+        raw.lowercase()
+            .replace(Regex("[,;:!?.\\-_/]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            // Head fillers only, anchored. A global strip corrupts real
+            // queries — "search just eat" would become "search eat".
+            .replace(Regex("^(?:(?:uh|um|er|ok|okay|hey|please|can you|could you)[\\s]+)+"), "")
+            .replace(Regex("\\s+please$"), "")
+            .trim()
+
     /** The voice-command grammar. Anything unmatched becomes a page-agent task. */
     private fun routeCommand(raw: String) {
-        val text = raw.trim().trimEnd('.', '!', '?').lowercase()
+        val text = normalizeCommand(raw)
         Log.d(TAG, "voice command: $text")
+
+        // Cheap local navigation. These are the most frequent actions and used
+        // to fall through to the LLM — a ~60s round trip that then failed
+        // anyway, because page-agent's own prompt forbids leaving the page.
+        when (text) {
+            "go back", "back" -> { goBack(); return }
+            "go forward", "forward" -> { showStatus("› Forward", 1200); webView.goForward(); return }
+            "go home", "home" -> { showStatus("⌂ Home", 1500); webView.loadUrl(HOME); return }
+            "scroll down", "down" -> { scrollPage(420); return }
+            "scroll up", "up" -> { scrollPage(-420); return }
+            "top", "scroll to top" -> { webView.evaluateJavascript("scrollTo(0,0)", null); return }
+            "bottom", "scroll to bottom" -> {
+                webView.evaluateJavascript("scrollTo(0,document.body.scrollHeight)", null); return
+            }
+            "help", "what can i say", "what can you do" -> { showHelp(); return }
+        }
 
         // "search <q> on duckduckgo|google" — engine name tolerant of Whisper's
         // spacing (duck duck go / duckduck go / ddg).
-        Regex("^search (?:for )?(.+?)\\s+(?:on|in|using|with|via)\\s+(duck\\s*duck\\s*go|duckduckgo|ddg|google)\\b.*$")
+        // The engine alternation tolerates the punctuation Whisper inserts even
+        // after normalisation ("duck duck go", "duckduck go", "ddg").
+        Regex("^search (?:for )?(.+?)\\s+(?:on|in|using|with|via)\\s+(duck\\s*[,.]?\\s*duck\\s*[,.]?\\s*go|duckduckgo|ddg|google)\\b.*$")
             .find(text)?.let { m ->
                 runSearch(m.groupValues[1], m.groupValues[2].startsWith("google"))
                 return
@@ -419,8 +521,11 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
         // Add-bookmark intents (kept distinct from "delete … bookmark" / "open bookmarks",
         // which are matched below): "bookmark this page", "add bookmark", "save this page".
-        if (text.contains("bookmark this") || text.contains("add bookmark") ||
-            text.contains("save this") || text == "bookmark" || text == "bookmark page"
+        // ANCHORED, not contains(). "how do i save this document" used to
+        // bookmark the page. The tails stay optional so bare "bookmark" and
+        // "add bookmark" — both of which work today — keep working.
+        if (Regex("^(?:bookmark|save)(?: this| the)?(?: page)?$").matches(text) ||
+            Regex("^add (?:a )?bookmark$").matches(text)
         ) {
             val url = webView.url.orEmpty()
             if (url.isEmpty() || url.startsWith(INTERNAL_BASE)) {
@@ -446,7 +551,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             showBookmarksPage(); return
         }
 
-        if (text.contains("refresh") || text == "reload" || text.contains("reload page")) {
+        // Anchored: "refresh my memory on this article" used to reload the page,
+        // destroying scroll position and the injected agent. Bare "refresh" must
+        // keep working — the app's own recovery hint tells the user to say it.
+        if (Regex("^(?:refresh|reload)(?: (?:this|the) page| page)?$").matches(text)) {
             showStatus("⟳ Refreshing", 2000)
             webView.reload(); return
         }
@@ -459,11 +567,17 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 return
             }
         }
-        // A bare utterance that strongly matches a bookmark opens it.
-        bookmarks.bestMatch(text)?.let { bm ->
-            showStatus("→ ${bm.title.take(44)}", 2500)
-            webView.loadUrl(bm.url)
-            return
+        // A bare utterance that strongly matches a bookmark opens it — but
+        // only a SHORT one. A whole spoken sentence accumulating stray points
+        // used to navigate away mid-thought and destroy the agent session, so
+        // this path now demands few words, a higher score, and a whole-keyword
+        // hit. Explicit "open <x>" above keeps the permissive threshold.
+        if (BookmarkStore.tokenize(text).size <= 3) {
+            bookmarks.bestMatch(text, minScore = 6, requireExact = true)?.let { bm ->
+                showStatus("→ ${bm.title.take(44)}", 2500)
+                webView.loadUrl(bm.url)
+                return
+            }
         }
 
         // Default: hand the request to page-agent on the current page.
@@ -512,6 +626,72 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     }
 
     /** Force a dark render so pages sit on black (waveguide off), like TapLink. */
+    /**
+     * Collapse the empty slots that host-blocking leaves behind.
+     *
+     * Network blocking kills the ad but not the same-origin container reserving
+     * space for it, so pages end up with tall blank gaps — worse on a waveguide
+     * than the ad was.
+     *
+     * Scope is deliberately narrow: unambiguous ad-tech markup ONLY. A generic
+     * "big fixed overlay with little text" heuristic was considered and rejected
+     * — it matches page-agent's own simulator mask exactly (position:fixed,
+     * inset:0, z-index:2147483641, negligible text), and on a device whose only
+     * input is tap counts, a false positive that eats a consent dialog or login
+     * modal is unrecoverable in the field.
+     *
+     * Hides via visibility/height rather than removing nodes: page-agent reads
+     * the DOM as indexed text, and deleting elements changes what it can act on.
+     */
+    private fun injectCosmeticFilter() {
+        val js = """
+            (function(){
+              var AGENT = '#page-agent-runtime_agent-panel,#page-agent-runtime_simulator-mask';
+              if (!window.__svCos){
+                window.__svCos = true;
+                var s = document.createElement('style');
+                s.id = '__svCosStyle';
+                s.textContent =
+                  'ins.adsbygoogle,[id^="google_ads"],[id^="div-gpt-ad"],[class*="ad-slot"],' +
+                  '[data-ad-client],[data-ad-slot],[data-adunit],iframe[src*="doubleclick"],' +
+                  'iframe[src*="googlesyndication"],iframe[src*="amazon-adsystem"]' +
+                  '{display:none!important}';
+                (document.head||document.documentElement).appendChild(s);
+              }
+              // Sweep separately from the stylesheet so it can re-run on SPA
+              // route changes; collapsing only AFTER an element has measured
+              // zero avoids nuking slots that fill in late.
+              function sweep(){
+                var sel = 'ins.adsbygoogle,[id^="google_ads"],[id^="div-gpt-ad"],[class*="ad-slot"]';
+                var n = document.querySelectorAll(sel);
+                for (var i=0;i<n.length;i++){
+                  var e = n[i];
+                  if (e.closest && e.closest(AGENT)) continue;
+                  var p = e.parentElement;
+                  if (p && p.children.length === 1){
+                    var r = p.getBoundingClientRect();
+                    if (r.height > 40 && (p.innerText||'').trim().length < 8){
+                      p.style.setProperty('height','0','important');
+                      p.style.setProperty('min-height','0','important');
+                      p.style.setProperty('overflow','hidden','important');
+                    }
+                  }
+                }
+              }
+              sweep();
+              if (!window.__svCosObs){
+                var t = null;
+                window.__svCosObs = new MutationObserver(function(){
+                  if (t) return;
+                  t = setTimeout(function(){ t = null; sweep(); }, 500);
+                });
+                window.__svCosObs.observe(document.documentElement, {childList:true, subtree:true});
+              }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
     private fun injectDarkMode() {
         val js = """
             (function(){
@@ -1283,6 +1463,9 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
+            // Dim first: it used to navigate the page while still blacked out,
+            // so the user could not see what they had just done.
+            dimMode -> exitDim()
             this::keyboardContainer.isInitialized && keyboardContainer.visibility == View.VISIBLE -> hideKeyboard()
             this::webView.isInitialized && webView.canGoBack() -> webView.goBack()
             else -> @Suppress("DEPRECATION") super.onBackPressed()

@@ -1,0 +1,4 @@
+# Domains the unified list misses. Matching walks parent labels, but the list
+# carries 32 *.pubmatic.com hosts WITHOUT the apex, so image7/simage1.pubmatic.com
+# slip an exact-match lookup. Adding the apex covers the whole tree.
+pubmatic.com
