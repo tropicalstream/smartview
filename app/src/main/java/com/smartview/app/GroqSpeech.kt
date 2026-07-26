@@ -276,6 +276,26 @@ object GroqSpeech {
      */
     @Volatile private var groqTtsBlockedUntil = 0L
 
+    /**
+     * The cooldown has to survive a restart.
+     *
+     * The cap is a DAILY budget but the flag was in memory only, so every
+     * relaunch retried a provider already known to be out — one wasted round
+     * trip per session, and a quota warning that can surface on screen. Keep it
+     * in prefs and the app simply stays on the working provider.
+     */
+    private fun blockedUntil(context: Context): Long {
+        if (groqTtsBlockedUntil == 0L) {
+            groqTtsBlockedUntil = prefs(context).getLong("groq_tts_blocked_until", 0L)
+        }
+        return groqTtsBlockedUntil
+    }
+
+    private fun blockGroqTts(context: Context, ms: Long) {
+        groqTtsBlockedUntil = System.currentTimeMillis() + ms
+        prefs(context).edit().putLong("groq_tts_blocked_until", groqTtsBlockedUntil).apply()
+    }
+
     /** Parse Groq's "try again in 25m59.99s" into millis; 0 if not present. */
     private fun retryAfterMs(raw: String?): Long {
         val m = Regex("try again in ([0-9hms.]+)").find(raw.orEmpty())?.groupValues?.get(1) ?: return 0L
@@ -395,7 +415,7 @@ object GroqSpeech {
         Thread {
             var failure: String? = null
             // Known-exhausted: don't spend a round trip proving it again.
-            val skipGroq = System.currentTimeMillis() < groqTtsBlockedUntil
+            val skipGroq = System.currentTimeMillis() < blockedUntil(context)
             var wav = if (skipGroq) null else runCatching {
                 val payload = JSONObject()
                     .put("model", TTS_MODEL)
@@ -433,7 +453,7 @@ object GroqSpeech {
                 Log.w(TAG, "tts failed: ${it.message}")
                 failure = speechFailureReason(it.message)
                 retryAfterMs(it.message).takeIf { ms -> ms > 0 }?.let { ms ->
-                    groqTtsBlockedUntil = System.currentTimeMillis() + ms
+                    blockGroqTts(context, ms)
                     Log.d(TAG, "groq tts blocked for ${ms / 1000}s; using fallback")
                 }
             }.getOrNull()
