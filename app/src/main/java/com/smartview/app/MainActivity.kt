@@ -67,6 +67,11 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private enum class VoiceMode { NONE, COMMAND, AGENT_ANSWER, DICTATION }
     private var voiceMode = VoiceMode.NONE
     private var agentVisible = false
+
+    /** True from task dispatch until a terminal callback. Distinct from
+     *  agentVisible (which tracks the panel) because the panel can be hidden
+     *  while a task is still stepping. */
+    private var agentRunning = false
     /** Outstanding page-agent ask_user request id awaiting a spoken answer. */
     private var pendingAskId: String? = null
     private val autoStopRecording = Runnable { if (recorder.isRecording) stopVoiceAndProcess() }
@@ -567,6 +572,25 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 return
             }
         }
+        // Cancel a running agent. ANCHORED to the whole utterance on purpose:
+        // a contains() version would swallow "stop the video", "cancel my
+        // order" and "stop sharing", all of which are legitimate agent tasks.
+        // Gated on agentRunning so these stay available as tasks otherwise.
+        if (agentRunning &&
+            Regex("^(?:stop|cancel|abort|never ?mind|forget it|quit)(?: it| that| the agent| the task| task)?$")
+                .matches(text)
+        ) {
+            // Clear the pending ask BEFORE closing: __svAgentClose aborts the
+            // resolver, after which a late __svAnswer is a silent no-op.
+            pendingAskId = null
+            clearAgentWatchdog()
+            agentVisible = false
+            webView.evaluateJavascript("try{window.__svAgentClose&&window.__svAgentClose()}catch(e){}", null)
+            GroqSpeech.stopSpeaking()
+            showStatus("Agent stopped", 2000)
+            return
+        }
+
         // A bare utterance that strongly matches a bookmark opens it — but
         // only a SHORT one. A whole spoken sentence accumulating stray points
         // used to navigate away mid-thought and destroy the agent session, so
@@ -893,12 +917,33 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 };
                 window.__svAgentTask = function(task){
                   try{
+                    // A second task while one is running used to reach
+                    // execute(), which throws "A task is already running" —
+                    // surfacing as a spoken "Agent error" while the panel had
+                    // already swapped to the new task and the old one kept
+                    // stepping invisibly. Refuse explicitly instead. Still call
+                    // __svAgentShow: it is the only thing that brings the panel
+                    // (and its cancel control) back after a hide.
+                    var st = '';
+                    try{ st = window.pageAgent.status || ''; }catch(e){}
+                    if (st === 'running'){
+                      window.__svAgentShow(task);
+                      SvBridge.onAgentBusy(String(task));
+                      return;
+                    }
                     window.__svAgentShow(task);
                     Promise.resolve(window.pageAgent.execute(task)).then(function(res){
-                      var msg = '';
-                      try{ msg = (res && (res.message || res.summary || res.result || res.text)) || (typeof res === 'string' ? res : ''); }catch(e){}
-                      if (!msg) msg = (window.__svPanelText || '').slice(-600);
-                      SvBridge.onAgentDone(String(msg || 'Task finished.'));
+                      // execute() RESOLVES for LLM errors, step-limit
+                      // exhaustion and user abort — only disposal/duplicate/
+                      // empty-task reject. So success has to be read off the
+                      // result, not inferred from "did not throw". The old code
+                      // probed message/summary/result/text (none of which
+                      // exist) and then read a mid-word tail of scraped panel
+                      // innerText aloud, emoji and button labels included.
+                      var ok = !!(res && res.success);
+                      var msg = (res && res.data) || '';
+                      if (ok) SvBridge.onAgentDone(String(msg || 'Task finished.'));
+                      else SvBridge.onAgentError(String(msg || 'Task did not complete.'));
                     }).catch(function(e){
                       SvBridge.onAgentError(String((e && e.message) || e));
                     });
@@ -936,12 +981,63 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
      * Run an agent task, re-injecting page-agent if it isn't loaded on this page
      * (e.g. the page was opened while offline, so the error page ate the injection).
      */
+    /**
+     * Idle watchdog for a running agent task.
+     *
+     * Deliberately IDLE-based, not a wall clock: a legitimate multi-step run
+     * takes minutes, and a total cap would kill healthy tasks. Rearmed on every
+     * sign of life (LLM response, a question, a panel-text change), so it only
+     * fires on true silence.
+     *
+     * This is also the only recovery from the navigation-death case, where the
+     * page that held the agent is gone and asking it to stop is a no-op —
+     * observed as "Thinking…" forever with no way out.
+     */
+    // Explicit type: the body re-posts itself while an ask is pending, and
+    // Kotlin cannot infer the type of a self-referential declaration.
+    private val agentWatchdog: Runnable = Runnable {
+        if (!agentRunning) return@Runnable
+        // The agent is allowed to sit silent while it is waiting on a HUMAN.
+        // ask_user legitimately spans: speak the question, open the mic for up
+        // to 8s, Whisper round trip, and however long the wearer takes to
+        // answer. This watchdog exists to catch a dead AGENT, so while an ask
+        // is outstanding it re-arms instead of firing. (Caught in testing: the
+        // first version killed a perfectly healthy task mid-question and told
+        // the user the agent had stopped responding.)
+        if (pendingAskId != null) {
+            main.postDelayed(agentWatchdog, AGENT_IDLE_MS)
+            return@Runnable
+        }
+        Log.w(TAG, "agent watchdog: no activity for ${AGENT_IDLE_MS}ms — recovering")
+        agentRunning = false
+        agentVisible = false
+        pendingAskId = null
+        runCatching { webView.evaluateJavascript("try{window.__svAgentClose&&window.__svAgentClose()}catch(e){}", null) }
+        showStatus("Agent stopped responding — say \"refresh\" to reload", 5000)
+        GroqSpeech.speak(this, "The agent stopped responding.") {}
+    }
+
+    private fun armAgentWatchdog() {
+        main.removeCallbacks(agentWatchdog)
+        if (agentRunning) main.postDelayed(agentWatchdog, AGENT_IDLE_MS)
+    }
+
+    private fun clearAgentWatchdog() {
+        agentRunning = false
+        main.removeCallbacks(agentWatchdog)
+    }
+
     private fun dispatchAgentTask(task: String, retry: Boolean) {
         webView.evaluateJavascript("(typeof window.__svAgentTask==='function')") { r ->
             when {
                 r == "true" -> {
                     cancelAgentHide()
                     agentVisible = true
+                    // Armed only here, in the branch that actually starts a
+                    // task — not in the retry recursion below, which would
+                    // otherwise start a timer for a task that never ran.
+                    agentRunning = true
+                    armAgentWatchdog()
                     showStatus("🤖 " + task.take(48), 3000)
                     webView.evaluateJavascript("window.__svAgentTask(${JSONObject.quote(task)})", null)
                 }
@@ -958,6 +1054,8 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     /** Resolve page-agent's pending ask_user question with the spoken answer. */
     private fun answerAgent(text: String) {
         val id = pendingAskId ?: return
+        // Answer delivered: the agent owns the clock again.
+        armAgentWatchdog()
         pendingAskId = null
         js("window.__svAnswer && window.__svAnswer(${JSONObject.quote(id)}, ${JSONObject.quote(text)})")
     }
@@ -987,6 +1085,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             Log.d(TAG, "page-agent ready on ${webView.url}")
         }
         @JavascriptInterface fun onAgentDone(message: String) = runOnUiThread {
+            clearAgentWatchdog()
             if (!agentVisible) return@runOnUiThread
             cancelAgentHide()
             showStatus("🤖 " + message.take(60), 4000)
@@ -997,6 +1096,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         }
         /** page-agent asked the user a question (ask_user tool). Read it, then listen. */
         @JavascriptInterface fun onAgentAsk(id: String, question: String) = runOnUiThread {
+            armAgentWatchdog()
             agentVisible = true
             cancelAgentHide()
             pendingAskId = id
@@ -1008,6 +1108,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         }
         /** User clicked the panel's ✕ — tear down the agent interaction at once. */
         @JavascriptInterface fun onAgentClosed() = runOnUiThread {
+            clearAgentWatchdog()
             agentVisible = false
             cancelAgentHide()
             pendingAskId = null
@@ -1020,6 +1121,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             showStatus("Agent closed", 1500)
         }
         @JavascriptInterface fun onAgentError(message: String) = runOnUiThread {
+            clearAgentWatchdog()
             // Ignore the abort that fires after the user closed the panel.
             if (!agentVisible) return@runOnUiThread
             Log.w(TAG, "page-agent error: $message")
@@ -1029,9 +1131,19 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             }
         }
 
+        /** A task was refused because one is already running. */
+        @JavascriptInterface fun onAgentBusy(task: String) = runOnUiThread {
+            armAgentWatchdog()
+            agentVisible = true
+            cancelAgentHide()
+            showStatus("Still working — say \"stop\" to cancel", 4000)
+            GroqSpeech.speak(this@MainActivity, "Still working on the previous task. Say stop to cancel.") {}
+        }
+
         /** page-agent fetch proxy: perform the Groq call natively (bypasses page CSP). */
         @JavascriptInterface fun llmFetch(id: String, url: String, method: String, headersJson: String, body: String) {
             val safeId = id.replace(Regex("[^A-Za-z0-9]"), "")
+            runOnUiThread { armAgentWatchdog() }
             // DIAG: measure page-agent request size (~chars/4 ≈ tokens).
             Log.d(TAG, "llmFetch REQ bytes=${body.length} ~${body.length / 4}tok")
             GroqSpeech.rawRequest(url, method, headersJson, body) { code, ok, bytes ->
@@ -1484,6 +1596,11 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     companion object {
         private const val TAG = "SmartView"
         private const val HOME = "https://duckduckgo.com/"
+
+        /** Idle timeout for a running agent task. Generous on purpose: a real
+         *  multi-step run goes quiet for a long time between LLM round trips,
+         *  and this must only fire on a genuine stall. */
+        private const val AGENT_IDLE_MS = 90_000L
         private const val INTERNAL_BASE = "https://smartview.internal/"
         private const val MAX_RECORD_MS = 8000L
         private const val AGENT_HIDE_MS = 5000L
