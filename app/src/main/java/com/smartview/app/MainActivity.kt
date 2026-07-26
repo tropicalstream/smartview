@@ -616,7 +616,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         if (dimMode) return
         dimMode = true
         GroqSpeech.stopSpeaking()
-        if (recorder.isRecording) { main.removeCallbacks(autoStopRecording); recorder.stop(); voiceMode = VoiceMode.NONE }
+        abortVoiceCapture()
         hideKeyboard()
         dimOverlay.visibility = View.VISIBLE
         dimOverlay.bringToFront()
@@ -633,6 +633,23 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         dimOverlay.visibility = View.GONE
         showStatus("Display on", 1200)
         binocular.invalidate()
+    }
+
+    /**
+     * Abort an in-flight voice capture without processing the audio.
+     *
+     * Every abandon-path must come through here. stopVoiceAndProcess() resets
+     * the keyboard's mic-key glow, but the abandon paths (enter dim, triple-tap
+     * to Settings, closing the agent panel) used to stop the recorder inline
+     * and skip that reset. The glow is the only recording indicator when the
+     * keyboard is up, so a stale glow inverts the control: the wearer taps the
+     * lit key to stop — and starts a NEW recording instead.
+     */
+    private fun abortVoiceCapture() {
+        main.removeCallbacks(autoStopRecording)
+        if (recorder.isRecording) recorder.stop()
+        voiceMode = VoiceMode.NONE
+        keyboardView?.setMicActive(false)
     }
 
     // ------------------------------------------------------------------
@@ -668,11 +685,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         // into the wearer's eyes.
         if (dimMode) { exitDim(); return }
         GroqSpeech.stopSpeaking()
-        if (recorder.isRecording) {
-            main.removeCallbacks(autoStopRecording)
-            recorder.stop()
-            voiceMode = VoiceMode.NONE
-        }
+        abortVoiceCapture()
         showBookmarksPage()
     }
 
@@ -1874,11 +1887,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             agentVisible = false
             cancelAgentHide()
             pendingAskId = null
-            if (voiceMode == VoiceMode.AGENT_ANSWER) {
-                main.removeCallbacks(autoStopRecording)
-                if (recorder.isRecording) recorder.stop()
-                voiceMode = VoiceMode.NONE
-            }
+            if (voiceMode == VoiceMode.AGENT_ANSWER) abortVoiceCapture()
             GroqSpeech.stopSpeaking()
             showStatus("Agent closed", 1500)
         }
