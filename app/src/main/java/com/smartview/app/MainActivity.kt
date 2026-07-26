@@ -784,7 +784,19 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             (function(){
               if (window.__svFetchProxyInstalled) return; window.__svFetchProxyInstalled = true;
               var HOSTS = [$hostsJs];
-              function isAgentUrl(u){ for (var i=0;i<HOSTS.length;i++){ if (u.indexOf(HOSTS[i]) >= 0) return true; } return false; }
+              // Compare the parsed HOST, not the raw string. The substring
+              // version matched the path and query too, so a page could route
+              // anything through the native bridge just by naming an allowed
+              // host in a query parameter. Native re-checks this — the page can
+              // redefine anything here, so that is the real control.
+              function isAgentUrl(u){
+                var h = '';
+                try { h = new URL(u, location.href).host.toLowerCase(); } catch(e){ return false; }
+                for (var i=0;i<HOSTS.length;i++){
+                  if (h === HOSTS[i] || h.endsWith('.' + HOSTS[i])) return true;
+                }
+                return false;
+              }
               var seq = 0, pending = {};
               window.__svFetchResolve = function(id, status, ok, b64){
                 var p = pending[id]; if(!p) return; delete pending[id];
@@ -830,8 +842,31 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 window.pageAgent = new window.PageAgent({
                   model: ${JSONObject.quote(provider.model)},
                   baseURL: ${JSONObject.quote(provider.baseUrl)},
-                  apiKey: ${JSONObject.quote(key)},
-                  language: 'en-US'
+                  // Placeholder, NOT the real credential. page-agent stores
+                  // options verbatim on this.config in the page's own JS world,
+                  // so any script on the page could read window.pageAgent
+                  // .config.apiKey. The real key is attached natively in
+                  // SvBridge.llmFetch, which the page cannot reach.
+                  apiKey: 'sv-proxy',
+                  language: 'en-US',
+                  // Every question costs the wearer a spoken prompt, up to 8s
+                  // of recording and a speech-to-text round trip — far more
+                  // expensive than on a desktop, where ask_user is nearly free.
+                  // So: answer from the page when the page can answer, and save
+                  // questions for genuine blockers.
+                  instructions: [
+                    'You are running on AR glasses. The user is hands-free and',
+                    'hears your replies spoken aloud.',
+                    'Prefer answering directly from the current page. Do NOT ask',
+                    'the user to confirm or clarify something you can determine',
+                    'by reading or scrolling the page yourself.',
+                    'Use ask_user ONLY when genuinely blocked: a credential is',
+                    'needed, an irreversible action needs consent, or the page',
+                    'truly does not contain the answer.',
+                    'If the page cannot answer, say so plainly and stop rather',
+                    'than asking a follow-up question.',
+                    'Keep final answers to a few sentences: they are read aloud.'
+                  ].join(' ')
                 });
                 try{ if(window.pageAgent.panel && window.pageAgent.panel.hide) window.pageAgent.panel.hide(); }catch(e){}
                 // Route page-agent's ask_user tool through native voice: read the
@@ -1146,7 +1181,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             runOnUiThread { armAgentWatchdog() }
             // DIAG: measure page-agent request size (~chars/4 ≈ tokens).
             Log.d(TAG, "llmFetch REQ bytes=${body.length} ~${body.length / 4}tok")
-            GroqSpeech.rawRequest(url, method, headersJson, body) { code, ok, bytes ->
+            GroqSpeech.rawRequest(this@MainActivity, url, method, headersJson, body) { code, ok, bytes ->
                 // DIAG: on a rate-limit/error, Groq's body states limit vs requested tokens.
                 if (!ok) Log.w(TAG, "llmFetch RESP $code: ${String(bytes).take(500)}")
                 runOnUiThread {
