@@ -296,6 +296,40 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                // A running task cannot survive this. page-agent lives in the
+                // document: unloading it takes the agent, the pending execute()
+                // promise and the task with it, and the fresh instance injected
+                // on the new page knows nothing about what was asked. Observed
+                // with "summarise the top story" — the agent's first move is to
+                // click through to the article, killing itself en route.
+                //
+                // The watchdog would eventually notice, but only after 90s of
+                // silence. The task is provably dead the moment the document
+                // goes, so say so now instead of making the wearer wait.
+                if (agentRunning) {
+                    // The JS context dies with the document, so the task is gone
+                    // either way — but the INTENT is still valid, and following a
+                    // link is often exactly the right move ("play the Mozart
+                    // recording" means search, open the item, then press play).
+                    // Carry the task to the new page instead of abandoning it.
+                    agentRunning = false
+                    pendingAskId = null
+                    clearAgentWatchdog()
+                    if (agentTaskText != null && agentHops < MAX_AGENT_HOPS) {
+                        agentResumePending = true
+                        Log.d(TAG, "agent followed a link (hop ${agentHops + 1}) — will resume")
+                        showStatus("Following the page…", 2500)
+                    } else {
+                        Log.w(TAG, "agent task lost: navigated away, no hops left")
+                        showStatus("Task ended — the page changed", 4000)
+                        val hadTask = agentTaskText != null
+                        agentTaskText = null; agentHops = 0
+                        if (hadTask) GroqSpeech.speak(
+                            this@MainActivity,
+                            "I followed too many pages without finishing. Ask me again here."
+                        ) { scheduleAgentHide() }
+                    }
+                }
                 injectPolyfills()
                 injectScrollAgent()
                 AdBlock.resetCount()
@@ -306,6 +340,24 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 super.onPageFinished(view, url)
                 injectPolyfills()
                 injectScrollAgent()
+                if (agentResumePending) {
+                    agentResumePending = false
+                    agentHops++
+                    val task = agentTaskText
+                    if (task != null) {
+                        // Give the fresh page-agent a moment to install, then hand
+                        // it the same task with the hop made explicit so it does
+                        // not simply repeat the click that brought it here.
+                        main.postDelayed({
+                            dispatchAgentTask(
+                                "$task\n\n(You navigated here yourself while working on the " +
+                                "task above. Arriving is not finishing: carry out the remaining " +
+                                "action on THIS page — if it was to play something, press play now.)",
+                                retry = true, isContinuation = true
+                            )
+                        }, 1200)
+                    }
+                }
                 // Mirrors the internal-page guard used for dark mode: the
                 // settings page is ours and must never be filtered.
                 if (url == null || !url.startsWith(INTERNAL_BASE)) injectCosmeticFilter()
@@ -763,6 +815,13 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     /** Utterance behind the current voice navigation, for the not-found retry. */
     private var pendingVoiceNav: String? = null
 
+    /** The task in flight, kept so it can be resumed if the page changes under it. */
+    private var agentTaskText: String? = null
+    /** Navigations this task has survived, so a link loop cannot run forever. */
+    private var agentHops = 0
+    /** A navigation interrupted the task; resume once the new document is ready. */
+    private var agentResumePending = false
+
     private fun routeCommand(raw: String, fuzzy: Boolean = false) {
         // Which branch claimed this utterance. Kept deliberately: the glasses
         // have no dev tools, and "what did it think I said, and where did that
@@ -853,11 +912,32 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 runSearch(m.groupValues[1], m.groupValues[2].startsWith("google"))
                 return
             }
-        // Bare "search <q>" defaults to DuckDuckGo.
+        // Bare "search <q>" defaults to DuckDuckGo — but ONLY when the sentence
+        // really is just a query.
+        //
+        // "search for Mozart and play the first recording you find" is a TASK:
+        // the searching is a means, the playing is the point. This rule used to
+        // swallow the whole utterance and send "mozart and play the first
+        // recording you find" to DuckDuckGo as a literal query, silently
+        // dropping the half the user actually cared about.
+        //
+        // Detected by ACTION VERB after a conjunction, not by the conjunction
+        // itself, so ordinary queries that merely contain "and" — "search for
+        // cats and dogs" — keep working.
         Regex("^search (?:for )?(.+)$").find(text)?.let { m ->
-            trace("searchBare:" + m.groupValues[1])
-            runSearch(m.groupValues[1], false)
-            return
+            val q = m.groupValues[1]
+            val wantsAction = Regex(
+                "\\b(?:and|then|,)\\s+(?:please\\s+)?" +
+                "(?:play|open|click|press|start|select|choose|read|tell|summari[sz]e|" +
+                "show|describe|explain|add|download|watch|listen)\\b",
+                RegexOption.IGNORE_CASE
+            ).containsMatchIn(q)
+            if (!wantsAction) {
+                trace("searchBare:$q")
+                runSearch(q, false)
+                return
+            }
+            trace("searchIsTask:$q")   // falls through to the agent below
         }
 
         // Add-bookmark intents (kept distinct from "delete … bookmark" / "open bookmarks",
@@ -1231,8 +1311,24 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                     'truly does not contain the answer.',
                     'If the page cannot answer, say so plainly and stop rather',
                     'than asking a follow-up question.',
+                    'You MAY follow a link when the task genuinely needs another',
+                    'page — searching, then opening a result, then acting on it',
+                    'is a normal sequence. Navigation ends your current run, but',
+                    'the app hands the same task to you again on the new page, so',
+                    'continue from wherever you land.',
+                    'Budget: about three navigations. Spend them on getting to',
+                    'the page that completes the task, not on browsing. If the',
+                    'current page can already answer, do not navigate at all.',
+                    'If the task is to PLAY, WATCH or LISTEN to something, then',
+                    'reaching the item is only halfway: you must actually press',
+                    'the play control on the page. Reporting that you found it',
+                    'is NOT completing it — do not call done until playback has',
+                    'been started.',
                     'Be thorough and specific in your final answer — give the',
                     'detail, figures and context you found, not a summary.',
+                    'On a list or index page, a headline alone is not an answer:',
+                    'read the standfirst, summary text, figures and dates that',
+                    'sit alongside it and give the substance of the item.',
                     'A single tap stops playback, so length is not a problem.'
                   ].join(' ') }
                 });
@@ -1430,7 +1526,9 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         main.removeCallbacks(agentWatchdog)
     }
 
-    private fun dispatchAgentTask(task: String, retry: Boolean) {
+    private fun dispatchAgentTask(task: String, retry: Boolean, isContinuation: Boolean = false) {
+        // A fresh task resets the hop budget; a continuation keeps counting.
+        if (!isContinuation) { agentTaskText = task; agentHops = 0 }
         webView.evaluateJavascript("(typeof window.__svAgentTask==='function')") { r ->
             when {
                 r == "true" -> {
@@ -1483,7 +1581,17 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             // sticky (it clears on a timer that any number of paths can cancel),
             // and gating typing on it alone turned every such glitch into
             // "the keyboard stopped working" with no way back.
-            if (agentVisible && agentRunning) return@runOnUiThread
+            if (agentVisible && agentRunning) {
+                // Returning early is not enough. The agent's input_text focuses a
+                // real field, and the SYSTEM IME can win the race and appear —
+                // on the X3 it renders across both eyes at the wrong scale and is
+                // unusable. Intermittent by nature (seen once, absent the next
+                // run), so suppress actively rather than relying on the
+                // setShowSoftInputOnFocus(false) set at configure time.
+                hideSystemKeyboard()
+                suppressImeFor(2500L)
+                return@runOnUiThread
+            }
             suppressImeFor(1800L); showKeyboard()
         }
         @JavascriptInterface fun onInputBlur() = runOnUiThread { hideSystemKeyboard() }
@@ -1492,6 +1600,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             Log.d(TAG, "page-agent ready on ${webView.url}")
         }
         @JavascriptInterface fun onAgentDone(message: String) = runOnUiThread {
+            agentTaskText = null; agentHops = 0; agentResumePending = false
             clearAgentWatchdog()
             if (!agentVisible) return@runOnUiThread
             cancelAgentHide()
@@ -1518,6 +1627,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         }
         /** User clicked the panel's ✕ — tear down the agent interaction at once. */
         @JavascriptInterface fun onAgentClosed() = runOnUiThread {
+            agentTaskText = null; agentHops = 0; agentResumePending = false
             clearAgentWatchdog()
             agentVisible = false
             cancelAgentHide()
@@ -2036,6 +2146,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
          *  multi-step run goes quiet for a long time between LLM round trips,
          *  and this must only fire on a genuine stall. */
         private const val AGENT_IDLE_MS = 90_000L
+
+        /** Navigations one task may follow. Enough for search -> item -> action,
+         *  low enough that a link loop cannot run away with the wearer's quota. */
+        private const val MAX_AGENT_HOPS = 3
         private const val INTERNAL_BASE = "https://smartview.internal/"
         private const val MAX_RECORD_MS = 8000L
         private const val AGENT_HIDE_MS = 5000L
