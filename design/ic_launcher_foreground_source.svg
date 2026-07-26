@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <defs>
+    <radialGradient id="ocean" cx="42%" cy="38%" r="70%">
+      <stop offset="0%" stop-color="#7FD4FF"/>
+      <stop offset="45%" stop-color="#2E86DE"/>
+      <stop offset="100%" stop-color="#123E70"/>
+    </radialGradient>
+    <linearGradient id="lens" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#BFE9FF" stop-opacity="0.85"/>
+      <stop offset="55%" stop-color="#5FB8E8" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#1B3A5C" stop-opacity="0.65"/>
+    </linearGradient>
+    <clipPath id="globeClip">
+      <circle cx="54" cy="54" r="26"/>
+    </clipPath>
+  </defs>
+
+  <!-- ================= EARTH ================= -->
+  <g>
+    <circle cx="54" cy="54" r="26" fill="url(#ocean)"/>
+    <g clip-path="url(#globeClip)" fill="#3FA34D">
+      <path d="M32,40 C36,34 46,33 50,37 C53,40 51,44 46,44 C50,46 49,51 44,51 C38,51 33,47 32,40 Z"/>
+      <path d="M58,32 C66,31 74,35 74,41 C74,46 68,47 63,45 C67,49 64,54 58,52 C53,50 52,42 55,37 C53,35 55,33 58,32 Z"/>
+      <path d="M40,58 C46,56 54,58 55,64 C56,69 50,72 45,70 C48,73 45,77 40,75 C34,72 33,64 36,60 Z"/>
+      <path d="M64,58 C70,57 76,61 75,66 C74,70 68,71 65,68 C66,72 61,74 58,71 C55,67 58,60 64,58 Z"/>
+    </g>
+    <!-- terminator shading for a lit-sphere feel -->
+    <circle cx="54" cy="54" r="26" fill="black" opacity="0.16" clip-path="url(#globeClip)"
+            transform="translate(9,7)"/>
+    <!-- soft highlight -->
+    <ellipse cx="45" cy="43" rx="9" ry="6" fill="#FFFFFF" opacity="0.22" clip-path="url(#globeClip)"/>
+    <circle cx="54" cy="54" r="26" fill="none" stroke="#0B2036" stroke-opacity="0.5" stroke-width="0.6"/>
+  </g>
+
+  <!-- ================= GLASSES ================= -->
+  <g>
+    <!-- temple arms (drawn under the frame). Deliberately asymmetric, like the
+         real X3 Pro: the right arm carries the electronics hump, the left is
+         a plain hinge — matched with a small hinge dot so it reads as
+         designed rather than merely shorter. -->
+    <path d="M18,49 L9,45.5 C6.5,44.4 6.3,40.8 8.7,39.4 L14,36.4"
+          fill="none" stroke="#0E1C33" stroke-width="5.4" stroke-linecap="round"/>
+    <circle cx="9" cy="45.5" r="2.6" fill="#0E1C33" stroke="#2A4A72" stroke-width="0.7"/>
+
+    <path d="M90,49 L96,45.6 C97.6,44.7 97.6,44.7 98,44.5"
+          fill="none" stroke="#0E1C33" stroke-width="5.4" stroke-linecap="round"/>
+
+    <!-- main frame bar -->
+    <rect x="16" y="45" width="76" height="10" rx="5" fill="#12213D"/>
+
+    <!-- lenses -->
+    <rect x="20" y="43.5" width="26" height="13" rx="6" fill="url(#lens)" stroke="#0B1830" stroke-width="1.4"/>
+    <rect x="62" y="43.5" width="26" height="13" rx="6" fill="url(#lens)" stroke="#0B1830" stroke-width="1.4"/>
+    <path d="M25,47 L38,50" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1.6" stroke-linecap="round"/>
+    <path d="M67,47 L80,50" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1.6" stroke-linecap="round"/>
+
+    <!-- bridge -->
+    <rect x="46" y="47.5" width="16" height="5" rx="2.5" fill="#12213D"/>
+  </g>
+
+  <!-- ============ MODEM MOTIF (right temple electronics) ============ -->
+  <!-- Pulled in from the canvas edge so it survives a circular launcher mask
+       (safe content radius is 33 from center) instead of bleeding off-screen. -->
+  <g>
+    <rect x="90" y="41" width="10" height="8" rx="2.4" fill="#0E1C33" stroke="#274468" stroke-width="0.8"/>
+    <circle cx="92.6" cy="45" r="1.05" fill="#4ADE80"/>
+    <circle cx="95" cy="45" r="1.05" fill="#FBBF24"/>
+    <circle cx="97.4" cy="45" r="1.05" fill="#8FD3FF"/>
+
+    <path d="M95,38.4 A8,8 0 0 1 101,41.4" fill="none" stroke="#8FD3FF" stroke-width="1.5" stroke-linecap="round" opacity="0.9"/>
+    <path d="M92,33.6 A15,15 0 0 1 101,38.6" fill="none" stroke="#8FD3FF" stroke-width="1.4" stroke-linecap="round" opacity="0.55"/>
+    <path d="M89,29 A21,21 0 0 1 101,34.4" fill="none" stroke="#8FD3FF" stroke-width="1.3" stroke-linecap="round" opacity="0.3"/>
+  </g>
+</svg>
