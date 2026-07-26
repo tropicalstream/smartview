@@ -74,7 +74,16 @@ class BookmarkStore(context: Context) {
                     else if (w.length >= 5 && (kw.contains(w) || w.contains(kw))) score += 1
                 }
             }
-            if (score > bestScore) { bestScore = score; best = bm; bestExact = exact }
+            // A search-results page is a waypoint, not a destination, and its
+            // title mirrors the query — so it collides with the real page on
+            // exactly the words the user would say. Observed: "open terrier"
+            // matched a saved DuckDuckGo results page instead of the breed page
+            // it was a search FOR, because both scored 3 on "terrier".
+            if (isSearchPage(bm.url)) score -= 2
+            // >= so that on a tie the LATER bookmark wins. Ties are common
+            // (same page saved twice, a results page and its target), and the
+            // most recently saved one is the one just asked for.
+            if (score >= bestScore && score > 0) { bestScore = score; best = bm; bestExact = exact }
         }
         if (bestScore < minScore) return null
         if (requireExact && !bestExact) return null
@@ -100,6 +109,15 @@ class BookmarkStore(context: Context) {
             "are", "with", "by", "from", "home", "page", "official", "site", "website",
             "welcome", "www", "com", "org", "net", "io", "html", "index"
         )
+
+        /** A results page of a search engine, not a real destination. */
+        fun isSearchPage(url: String): Boolean = runCatching {
+            val u = android.net.Uri.parse(url)
+            val h = u.host.orEmpty().removePrefix("www.")
+            val engine = h.contains("duckduckgo.") || h.contains("google.") ||
+                h.contains("bing.com") || h.contains("search.")
+            engine && (u.getQueryParameter("q") != null || u.path?.contains("search") == true)
+        }.getOrDefault(false)
 
         fun tokenize(s: String): List<String> =
             s.lowercase().split(Regex("[^a-z0-9]+"))
