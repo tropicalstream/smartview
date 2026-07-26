@@ -83,6 +83,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
     // sequence settles it dispatches single click / double / triple by count.
     private var lastTapUpTime = 0L
     private var tapCount = 0
+    /** First tap of the current sequence was consumed (stopped speech/recording). */
+    private var consumedTap = false
     private var multiTapRunnable: Runnable? = null
 
     private var edgeScrollDy = 0
@@ -273,25 +275,33 @@ class BinocularSbsLayout @JvmOverloads constructor(
 
     /** Unified tap entry for touch taps and temple-key presses. */
     private fun onTapUp() {
-        if (tapInterceptor?.invoke() == true) {
-            // Consumed (e.g. stopped a recording); reset the tap sequence.
-            cancelMultiTap()
-            return
-        }
+        // A consumed tap (one that stopped speech or a recording) used to reset
+        // the whole sequence, zeroing tapCount AND lastTapUpTime — so the very
+        // next tap started a fresh count of one and resolved to a page CLICK.
+        // The effect: while the app is speaking, "double-tap to talk" is
+        // unavailable precisely when it invites you to tap, and the second tap
+        // lands on whatever is under the cursor instead. Keep the sequence
+        // running and just remember the first tap was already spent.
+        val consumed = tapInterceptor?.invoke() == true
         val now = SystemClock.uptimeMillis()
         val sincePrev = now - lastTapUpTime
         lastTapUpTime = now
         // Continue the sequence if this tap is inside the window, else start fresh.
         tapCount = if (multiTapRunnable != null && sincePrev in DOUBLE_TAP_MIN_GAP_MS..DOUBLE_TAP_WINDOW_MS)
             tapCount + 1 else 1
+        if (consumed) consumedTap = true
         multiTapRunnable?.let { removeCallbacks(it) }
         val r = Runnable {
             multiTapRunnable = null
             val n = tapCount
+            val spent = consumedTap
             tapCount = 0
+            consumedTap = false
             when {
                 n >= 3 -> tripleTapHandler?.invoke()
                 n == 2 -> doubleTapHandler?.invoke()
+                // A lone tap that already did its job must not also click the page.
+                spent -> {}
                 else -> performCursorClick()
             }
         }

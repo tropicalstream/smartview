@@ -162,6 +162,26 @@ object GroqSpeech {
                     .addFormDataPart("file", audio.name, audio.asRequestBody("audio/m4a".toMediaType()))
                     .addFormDataPart("model", STT_MODEL)
                     .addFormDataPart("response_format", "json")
+                    // Bias decoding toward the command vocabulary. Whisper is
+                    // tuned for prose, so a short clipped command lands on
+                    // whatever ordinary English is nearest: "bookmark this
+                    // page" came back as "bunk up this page" and fell through
+                    // to the agent. Priming the decoder fixes that where it
+                    // actually breaks, instead of guessing downstream — a
+                    // fuzzy matcher loose enough to rescue that transcript is
+                    // also loose enough to swallow "summarise this page".
+                    //
+                    // This is a HINT, not a grammar: dictation of arbitrary
+                    // text and URLs still transcribes normally.
+                    .addFormDataPart(
+                        "prompt",
+                        "Voice commands for a web browser: bookmark this page, " +
+                        "open bookmarks, delete bookmark, refresh, reload, go back, " +
+                        "go forward, go home, scroll down, scroll up, top, bottom, " +
+                        "stop, help. Also website names and questions about the page."
+                    )
+                    // Commands are short; sampling adds nothing but variance.
+                    .addFormDataPart("temperature", "0")
                     .build()
                 val req = Request.Builder()
                     .url("$BASE/audio/transcriptions")
@@ -203,13 +223,180 @@ object GroqSpeech {
 
     private var player: MediaPlayer? = null
 
+    /** Continuation + temp file owned by the CURRENT playback, so a cancel can settle them. */
+
+    private var pendingDone: (() -> Unit)? = null
+
+    private var pendingWav: File? = null
+
     /** Speak [text]; [onDone] fires on the main thread when playback ends/fails. */
+    /**
+     * Upper bound on a single spoken utterance.
+     *
+     * This is a RESOURCE guard, not a style choice: it bounds one TTS request,
+     * nothing more. Long answers are wanted — a thorough reply that runs a
+     * minute is a feature, and any single tap stops playback (see
+     * interceptTap), so the wearer is never trapped listening.
+     */
+    private const val SPEAK_MAX = 4000
+
+    /** Clip only if we hit the ceiling, and end on a sentence, not mid-word. */
+    private fun clipForSpeech(text: String): String {
+        val t = text.trim()
+        if (t.length <= SPEAK_MAX) return t
+        val head = t.take(SPEAK_MAX)
+        val cut = maxOf(head.lastIndexOf(". "), head.lastIndexOf("! "), head.lastIndexOf("? "))
+        return if (cut > SPEAK_MAX / 3) head.substring(0, cut + 1) else head.trimEnd() + "…"
+    }
+
+    /**
+     * Notified when an answer could not be SPOKEN, so the UI can show it instead.
+     *
+     * Losing the voice is not the same as losing the answer, but the code used
+     * to treat it that way: a failed TTS call was logged and the text dropped,
+     * leaving the user with silence. On glasses that is the most confusing
+     * possible outcome — silence is exactly what "it never heard me" looks
+     * like, so the user re-asks and burns the quota further.
+     *
+     * Hit for real during testing: Groq's free tier caps TTS at 3600 tokens per
+     * DAY, and once that trips every reply goes mute for hours.
+     *
+     * (text = what should have been said, reason = human-readable cause)
+     */
+    @Volatile var onSpeechFailure: ((text: String, reason: String) -> Unit)? = null
+
+    /**
+     * When Groq TTS will accept work again.
+     *
+     * The free tier's cap is a DAILY token budget, so once it trips it stays
+     * tripped for hours. Rediscovering that on every single utterance costs a
+     * pointless round trip before each reply and makes the app feel broken
+     * rather than degraded. Groq tells us how long to wait — believe it, and
+     * go straight to the fallback until then.
+     */
+    @Volatile private var groqTtsBlockedUntil = 0L
+
+    /** Parse Groq's "try again in 25m59.99s" into millis; 0 if not present. */
+    private fun retryAfterMs(raw: String?): Long {
+        val m = Regex("try again in ([0-9hms.]+)").find(raw.orEmpty())?.groupValues?.get(1) ?: return 0L
+        var ms = 0L
+        Regex("([0-9.]+)([hms])").findAll(m).forEach { g ->
+            val v = g.groupValues[1].toDoubleOrNull() ?: 0.0
+            ms += when (g.groupValues[2]) {
+                "h" -> (v * 3_600_000).toLong()
+                "m" -> (v * 60_000).toLong()
+                else -> (v * 1000).toLong()
+            }
+        }
+        return ms
+    }
+
+    /** Turn a provider error into something worth putting in front of a user. */
+    private fun speechFailureReason(raw: String?): String {
+        val m = raw.orEmpty()
+        return when {
+            m.contains("Rate limit", true) || m.contains("rate_limit", true) -> {
+                // Groq reports this as a float, so the raw string arrives as
+                // "25m59.999999999s". Drop the fractional part — nobody needs
+                // nanosecond precision on a "come back later".
+                val again = Regex("try again in ([0-9hms .]+)").find(m)?.groupValues?.get(1)
+                    ?.replace(Regex("\\.\\d+"), "")?.trim()?.trimEnd('.')
+                if (again != null) "Voice quota reached — retry in $again. Answer shown below."
+                else "Voice quota reached for today. Answer shown below."
+            }
+            m.contains("401") || m.contains("invalid_api_key", true) ->
+                "Voice unavailable: check your Groq key. Answer shown below."
+            else -> "Voice unavailable. Answer shown below."
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Gemini TTS — second source of voice
+    // ------------------------------------------------------------------
+
+    private const val GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+    private const val GEMINI_TTS_VOICE = "Kore"
+    private const val GEMINI_TTS_RATE = 24_000
+
+    /**
+     * Wrap raw PCM in a WAV header.
+     *
+     * Gemini hands back headerless signed 16-bit little-endian mono PCM
+     * ("audio/L16;codec=pcm;rate=24000"). MediaPlayer will not touch that
+     * without a container, so build the 44-byte canonical header ourselves.
+     */
+    private fun pcmToWav(pcm: ByteArray, sampleRate: Int): ByteArray {
+        val channels = 1; val bits = 16
+        val byteRate = sampleRate * channels * bits / 8
+        val out = java.io.ByteArrayOutputStream(44 + pcm.size)
+        fun s(v: String) = out.write(v.toByteArray(Charsets.US_ASCII))
+        fun i32(v: Int) = out.write(byteArrayOf(
+            (v and 0xff).toByte(), ((v shr 8) and 0xff).toByte(),
+            ((v shr 16) and 0xff).toByte(), ((v shr 24) and 0xff).toByte()))
+        fun i16(v: Int) = out.write(byteArrayOf((v and 0xff).toByte(), ((v shr 8) and 0xff).toByte()))
+        s("RIFF"); i32(36 + pcm.size); s("WAVE")
+        s("fmt "); i32(16); i16(1); i16(channels)
+        i32(sampleRate); i32(byteRate); i16(channels * bits / 8); i16(bits)
+        s("data"); i32(pcm.size)
+        out.write(pcm)
+        return out.toByteArray()
+    }
+
+    /**
+     * Speak via Gemini instead of Groq.
+     *
+     * Worth having because Groq's free tier caps TTS at 3600 tokens per DAY —
+     * small enough that ordinary use hits it and the app goes mute for hours.
+     * The Gemini key is already present for the agent, so this costs the user
+     * no extra setup and fails over to a provider with a separate quota.
+     *
+     * NOTE this is Google's NATIVE endpoint, so the key goes in x-goog-api-key.
+     * The agent path talks to the /v1beta/openai compatibility endpoint, which
+     * instead wants a Bearer token — sending the wrong one is a 400, and the
+     * two live a few lines apart, so keep them straight.
+     */
+    private fun geminiTts(context: Context, text: String): ByteArray? {
+        val key = prefs(context).getString("gemini_api_key", "").orEmpty()
+        if (key.isEmpty()) return null
+        val payload = JSONObject()
+            .put("contents", org.json.JSONArray().put(
+                JSONObject().put("parts", org.json.JSONArray().put(JSONObject().put("text", text)))))
+            .put("generationConfig", JSONObject()
+                .put("responseModalities", org.json.JSONArray().put("AUDIO"))
+                .put("speechConfig", JSONObject().put("voiceConfig", JSONObject()
+                    .put("prebuiltVoiceConfig", JSONObject().put("voiceName", GEMINI_TTS_VOICE)))))
+        val req = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_TTS_MODEL:generateContent")
+            .header("x-goog-api-key", key)
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        return runCatching {
+            http.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "gemini tts HTTP ${resp.code}: ${body.take(160)}")
+                    return@use null
+                }
+                val b64 = JSONObject(body)
+                    .getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                    .getJSONObject("inlineData").getString("data")
+                val pcm = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                Log.d(TAG, "gemini tts ${pcm.size} pcm bytes")
+                pcmToWav(pcm, GEMINI_TTS_RATE)
+            }
+        }.onFailure { Log.w(TAG, "gemini tts failed: ${it.message}") }.getOrNull()
+    }
+
     fun speak(context: Context, text: String, onDone: () -> Unit) {
         val key = apiKey(context)
-        val clipped = text.trim().take(1600)
+        val clipped = clipForSpeech(text)
         if (key.isEmpty() || clipped.isEmpty()) { main.post(onDone); return }
         Thread {
-            val wav = runCatching {
+            var failure: String? = null
+            // Known-exhausted: don't spend a round trip proving it again.
+            val skipGroq = System.currentTimeMillis() < groqTtsBlockedUntil
+            var wav = if (skipGroq) null else runCatching {
                 val payload = JSONObject()
                     .put("model", TTS_MODEL)
                     .put("voice", TTS_VOICE)
@@ -242,12 +429,42 @@ object GroqSpeech {
                     Log.d(TAG, "tts wav ${f.length()} bytes (voice=$TTS_VOICE)")
                     f
                 }
-            }.onFailure { Log.w(TAG, "tts failed: ${it.message}") }.getOrNull()
+            }.onFailure {
+                Log.w(TAG, "tts failed: ${it.message}")
+                failure = speechFailureReason(it.message)
+                retryAfterMs(it.message).takeIf { ms -> ms > 0 }?.let { ms ->
+                    groqTtsBlockedUntil = System.currentTimeMillis() + ms
+                    Log.d(TAG, "groq tts blocked for ${ms / 1000}s; using fallback")
+                }
+            }.getOrNull()
+
+            // Skipping Groq must still leave a reason behind: if the fallback
+            // also fails, the answer has to reach the screen rather than vanish.
+            if (skipGroq) failure = speechFailureReason("Rate limit reached")
+
+            // Groq is out — try Gemini before giving up on speaking at all.
+            // Different provider, separate quota, key already configured.
+            if (wav == null) {
+                geminiTts(context, clipped)?.let { bytes ->
+                    val f = File.createTempFile("tts_", ".wav", context.cacheDir)
+                    f.outputStream().use { o -> o.write(bytes) }
+                    Log.d(TAG, "tts via gemini fallback (${f.length()} bytes)")
+                    wav = f
+                    failure = null   // spoken after all; nothing to show on screen
+                }
+            }
             main.post {
-                if (wav == null) { onDone(); return@post }
+                if (wav == null) {
+                    // Hand the text to the UI before completing: the answer is
+                    // still good, only the voice is missing.
+                    failure?.let { r -> onSpeechFailure?.invoke(text, r) }
+                    onDone(); return@post
+                }
                 stopSpeaking()
                 val mp = MediaPlayer()
                 player = mp
+                pendingDone = onDone
+                pendingWav = wav
                 runCatching {
                     mp.setAudioAttributes(
                         AudioAttributes.Builder()
@@ -259,14 +476,14 @@ object GroqSpeech {
                     mp.setOnCompletionListener {
                         Log.d(TAG, "tts playback complete")
                         runCatching { mp.release() }
-                        if (player === mp) player = null
+                        if (player === mp) { player = null; pendingDone = null; pendingWav = null }
                         runCatching { wav.delete() }
                         onDone()
                     }
                     mp.setOnErrorListener { _, what, extra ->
                         Log.w(TAG, "tts MediaPlayer error what=$what extra=$extra")
                         runCatching { mp.release() }
-                        if (player === mp) player = null
+                        if (player === mp) { player = null; pendingDone = null; pendingWav = null }
                         runCatching { wav.delete() }
                         onDone(); true
                     }
@@ -277,7 +494,7 @@ object GroqSpeech {
                 }.onFailure {
                     Log.w(TAG, "tts play setup failed: ${it.message}")
                     runCatching { mp.release() }
-                    if (player === mp) player = null
+                    if (player === mp) { player = null; pendingDone = null; pendingWav = null }
                     runCatching { wav.delete() }
                     onDone()
                 }
@@ -426,9 +643,29 @@ object GroqSpeech {
 
     val isSpeaking: Boolean get() = player?.isPlaying == true
 
-    fun stopSpeaking() {
-        runCatching { player?.stop() }
-        runCatching { player?.release() }
-        player = null
+    /**
+     * Stop playback.
+     *
+     * MediaPlayer.stop()/release() do NOT fire OnCompletionListener, so the
+     * continuation handed to speak() is simply lost — and the app advertises
+     * "tap to stop", which routes here. That stranded the two callbacks the
+     * agent loop depends on: scheduleAgentHide() after an answer, and
+     * startVoice(AGENT_ANSWER) after an ask_user question.
+     *
+     * @param deliver run the pending continuation. TRUE only for a deliberate
+     *   USER cancel. Everything else — dim, settings, teardown, or being
+     *   pre-empted by the next utterance — must leave it false: those paths
+     *   are replacing or tearing down the very interaction the continuation
+     *   belonged to, and running it there would open the mic in dim mode, on
+     *   the settings page, or after onDestroy.
+     */
+    fun stopSpeaking(deliver: Boolean = false) {
+        val mp = player; player = null
+        val done = pendingDone; pendingDone = null
+        val wav = pendingWav; pendingWav = null
+        runCatching { mp?.stop() }
+        runCatching { mp?.release() }
+        runCatching { wav?.delete() }
+        if (deliver) done?.let { main.post(it) }
     }
 }

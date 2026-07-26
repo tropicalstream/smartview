@@ -235,6 +235,17 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         wv.addJavascriptInterface(SvBridge(), "SvBridge")
 
         AdBlock.warmUp(this)
+
+        // If the answer cannot be spoken, put it on screen rather than dropping
+        // it. Silence is the one failure a voice-first UI cannot express: it is
+        // identical to "never heard you", so the user just asks again.
+        // Deliberately generous here — this is the ONLY copy of the answer left,
+        // so unlike the ticker it gets the full text and a long dwell.
+        GroqSpeech.onSpeechFailure = { text, reason ->
+            runOnUiThread {
+                showStatus("🔇 $reason\n$text", 30_000)
+            }
+        }
         // Service-worker requests never reach WebViewClient, so a page with a SW
         // (most large sites) would otherwise fetch its ads straight past the
         // filter. Route them through the same check.
@@ -254,9 +265,39 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 view: WebView?, request: WebResourceRequest?
             ): WebResourceResponse? = AdBlock.intercept(request)
 
+            /**
+             * A dictated domain that does not resolve becomes a search.
+             *
+             * Speech recognition mangles bare domains routinely — "en.wikipedia.org"
+             * came back as "eain.wikipedia.org" in testing — and until now that
+             * dead-ended on the WebView's own error page: no voice affordance, no
+             * way forward, and the user cannot see a URL bar to correct a typo they
+             * never made. Searching for what they actually SAID recovers the intent
+             * almost every time.
+             *
+             * Only for the main frame, only for name-resolution failures (a real
+             * 404 or a flaky subresource must still surface honestly), and only
+             * once per utterance so a failing search cannot loop.
+             */
+            override fun onReceivedError(
+                view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame != true) return
+                val code = runCatching { error?.errorCode }.getOrNull()
+                if (code != ERROR_HOST_LOOKUP) return
+                val spoken = pendingVoiceNav ?: return
+                pendingVoiceNav = null
+                val q = java.net.URLEncoder.encode(spoken, "UTF-8")
+                Log.d(TAG, "host lookup failed; searching for spoken text instead")
+                showStatus("Site not found — searching for “${spoken.take(40)}”", 4000)
+                view?.loadUrl("https://duckduckgo.com/?q=$q")
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 injectPolyfills()
+                injectScrollAgent()
                 AdBlock.resetCount()
                 if (url == null || !url.startsWith(INTERNAL_BASE)) injectDarkMode()
             }
@@ -264,6 +305,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 injectPolyfills()
+                injectScrollAgent()
                 // Mirrors the internal-page guard used for dark mode: the
                 // settings page is ours and must never be filtered.
                 if (url == null || !url.startsWith(INTERNAL_BASE)) injectCosmeticFilter()
@@ -276,12 +318,184 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     }
 
     /** Vertical edge scrolling — scrolls the page (or its tallest scroller). */
+    /**
+     * Install the scroll agent: find the box that is actually scrollable under
+     * the cursor, not just the document.
+     *
+     * The old one-liner (document.scrollingElement.scrollTop += dy) is right on
+     * maybe half the web. On the other half the content lives in an inner
+     * overflow:auto pane, a virtualised list, a same-origin iframe, or a fixed
+     * full-screen panel, and poking the document scrolls something the wearer
+     * cannot see. akc.org was the reported case: at glasses viewport size its
+     * consent panel (position:fixed, overflow-y:auto) covers the whole screen,
+     * so the page dutifully scrolled behind it while nothing on screen moved.
+     *
+     * Order: the element we moved last (cheap, keeps the edge tick off the
+     * hit-test path) -> the hit-test stack under the cursor, walking outwards ->
+     * the biggest on-screen scroller anywhere -> the document. Every candidate
+     * is VERIFIED by actually moving it, because no combination of style tests
+     * classifies the real web correctly.
+     */
+    private fun injectScrollAgent() {
+        val js = """
+            (function(){
+              if (window.__svScroll) return;
+              var EPS = 2, MAX_FRAME_DEPTH = 6, CACHE_MS = 600, SCAN_COOLDOWN_MS = 500;
+              var hot = null, hotAt = 0, lastScanFail = 0;
+
+              function styleScrolls(el){
+                var s;
+                try { s = (el.ownerDocument.defaultView || window).getComputedStyle(el); } catch(e){ return false; }
+                if (!s) return false;
+                var oy = s.overflowY;
+                return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+              }
+              function isScroller(el){
+                if (!el || el.nodeType !== 1) return false;
+                if (el.scrollHeight - el.clientHeight <= EPS) return false;
+                var d = el.ownerDocument;
+                if (d && (el === d.scrollingElement || el === d.documentElement || el === d.body)) return true;
+                return styleScrolls(el);
+              }
+              function room(el, dy){
+                if (dy > 0) return el.scrollTop < el.scrollHeight - el.clientHeight - 1;
+                return el.scrollTop > 1;
+              }
+              function push(el, dy){
+                var before = el.scrollTop;
+                try { el.scrollTop = before + dy; } catch(e){ return false; }
+                if (Math.abs(el.scrollTop - before) > 0.5) { hot = el; hotAt = Date.now(); return true; }
+                var cs = null;
+                try { cs = (el.ownerDocument.defaultView || window).getComputedStyle(el); } catch(e){}
+                if (cs && cs.scrollBehavior === 'smooth' && el.style){
+                  var st = el.style, prev = st.scrollBehavior;
+                  try { st.scrollBehavior = 'auto'; } catch(e){}
+                  try { el.scrollTop = before + dy; } catch(e){}
+                  var moved = Math.abs(el.scrollTop - before) > 0.5;
+                  try { if (prev) st.scrollBehavior = prev; else st.removeProperty('scroll-behavior'); } catch(e){}
+                  if (moved) { hot = el; hotAt = Date.now(); }
+                  return moved;
+                }
+                return false;
+              }
+              function collect(root, x, y, depth, out){
+                if (!root || depth > MAX_FRAME_DEPTH) return;
+                var stack = [];
+                try {
+                  stack = root.elementsFromPoint ? root.elementsFromPoint(x, y) :
+                          (root.elementFromPoint ? [root.elementFromPoint(x, y)] : []);
+                } catch(e){ stack = []; }
+                for (var i = 0; i < stack.length; i++){
+                  var el = stack[i];
+                  if (!el || el.nodeType !== 1) continue;
+                  if (el.tagName === 'IFRAME' || el.tagName === 'FRAME'){
+                    var idoc = null;
+                    try { idoc = el.contentDocument; } catch(e){ idoc = null; }
+                    if (idoc){
+                      var r = el.getBoundingClientRect();
+                      collect(idoc, x - r.left, y - r.top, depth + 1, out);
+                    } else { out.blocked = true; }
+                    continue;
+                  }
+                  if (el.shadowRoot) collect(el.shadowRoot, x, y, depth + 1, out);
+                  var n = el;
+                  while (n && n.nodeType === 1){
+                    if (out.indexOf(n) < 0) out.push(n);
+                    var p = n.parentElement;
+                    if (!p){
+                      var rt = n.getRootNode ? n.getRootNode() : null;
+                      p = rt && rt.host ? rt.host : null;
+                    }
+                    n = p;
+                  }
+                }
+                var se = root.scrollingElement || root.documentElement;
+                if (se && out.indexOf(se) < 0) out.push(se);
+              }
+              function tryPoint(x, y, dy){
+                var out = [];
+                out.blocked = false;
+                collect(document, x, y, 0, out);
+                var sawScroller = false;
+                for (var i = 0; i < out.length; i++){
+                  var el = out[i];
+                  if (!isScroller(el)) continue;
+                  sawScroller = true;
+                  if (!room(el, dy)) continue;
+                  if (push(el, dy)) return 'el';
+                }
+                return out.blocked ? 'blocked' : (sawScroller ? 'end' : 'none');
+              }
+              window.__svScroll = function(dy, fx, fy){
+                dy = +dy || 0;
+                if (!dy) return 'none';
+                var de = document.documentElement || {};
+                var vw = window.innerWidth || de.clientWidth || 0;
+                var vh = window.innerHeight || de.clientHeight || 0;
+                if (!vw || !vh){
+                  var only = document.scrollingElement || de;
+                  return (only && push(only, dy)) ? 'el' : 'none';
+                }
+                var now = Date.now();
+                if (hot && now - hotAt < CACHE_MS &&
+                    (hot.isConnected === undefined || hot.isConnected) &&
+                    isScroller(hot) && room(hot, dy) && push(hot, dy)) return 'el';
+                var cx = (typeof fx === 'number' ? fx : 0.5) * vw;
+                var cy = (typeof fy === 'number' ? fy : 0.5) * vh;
+                var pts = [
+                  [cx, Math.min(Math.max(cy, vh * 0.3), vh * 0.7)],
+                  [cx, cy],
+                  [vw * 0.5, vh * 0.5]
+                ];
+                var res = 'none', blocked = false;
+                for (var i = 0; i < pts.length; i++){
+                  res = tryPoint(pts[i][0], pts[i][1], dy);
+                  if (res === 'el') return 'el';
+                  if (res === 'blocked') blocked = true;
+                }
+                if (now - lastScanFail > SCAN_COOLDOWN_MS){
+                  var best = null, bestArea = 0;
+                  var all = document.querySelectorAll('*');
+                  var lim = Math.min(all.length, 4000);
+                  for (var j = 0; j < lim; j++){
+                    var e = all[j];
+                    if (e.scrollHeight - e.clientHeight <= EPS) continue;
+                    if (!isScroller(e) || !room(e, dy)) continue;
+                    var r = e.getBoundingClientRect();
+                    if (r.width < 120 || r.height < 120) continue;
+                    if (r.bottom < 0 || r.top > vh) continue;
+                    var a = r.width * r.height;
+                    if (a > bestArea){ bestArea = a; best = e; }
+                  }
+                  if (best && push(best, dy)) return 'big';
+                  lastScanFail = now;
+                }
+                return blocked ? 'blocked' : res;
+              };
+            })();
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+
+    /** Vertical edge scrolling AND the voice scroll commands. */
     private fun scrollPage(dy: Int) {
         if (dy == 0) return
-        webView.evaluateJavascript(
-            "(function(){var se=document.scrollingElement||document.documentElement;se.scrollTop+=$dy;})();",
-            null
-        )
+        val w = webView.width
+        val h = webView.height
+        // The cursor is already in WebView pixel space; sending it as a FRACTION
+        // lets the page convert to CSS px itself, sidestepping devicePixelRatio
+        // and the wide-viewport initial scale entirely.
+        val fx = if (w > 0) (binocular.cursorPosX / w).coerceIn(0f, 1f) else 0.5f
+        val fy = if (h > 0) (binocular.cursorPosY / h).coerceIn(0f, 1f) else 0.5f
+        val call = "window.__svScroll && window.__svScroll($dy,$fx,$fy)"
+        webView.evaluateJavascript(call) { result ->
+            // "false" means the helper is not in THIS document - a navigation we
+            // did not see, or a document that replaced ours. Install and retry.
+            if (result == "false" || result == "null") {
+                injectScrollAgent()
+                webView.evaluateJavascript(call, null)
+            }
+        }
     }
 
     /** Back navigation: left-edge pull (when not dimmed) lands here. */
@@ -326,7 +540,13 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     /** Any single tap while recording/speaking stops it (consumes the tap). */
     private fun interceptTap(): Boolean {
         if (recorder.isRecording) { stopVoiceAndProcess(); return true }
-        if (GroqSpeech.isSpeaking) { GroqSpeech.stopSpeaking(); return true }
+        // The ONLY deliberate user cancel — this is the "tap to stop" the status
+        // pill advertises. Settle the continuation so the agent loop carries on
+        // (hide the panel, or re-open the mic for an ask_user answer) instead of
+        // stranding it. Every other stopSpeaking() call site is a teardown or a
+        // replacement, and delivering there would open the mic in dim mode, on
+        // the settings page, or after onDestroy.
+        if (GroqSpeech.isSpeaking) { GroqSpeech.stopSpeaking(deliver = true); return true }
         if (agentVisible) scheduleAgentHide() // click = interaction: restart 5s clock
         return false
     }
@@ -388,7 +608,14 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         if (!isOnline()) { audio.delete(); failVoice(mode, "📵 No internet connection"); return }
         showStatus("… transcribing", 0)
         GroqSpeech.transcribe(this, audio) { text, error ->
-            if (text.isNullOrBlank()) { failVoice(mode, error ?: "Didn't catch that"); return@transcribe }
+            // Whisper renders silence as punctuation — "." or "..." — which is
+            // not blank, so it used to sail through as a real utterance. In
+            // AGENT_ANSWER that is genuinely costly: the agent receives an empty
+            // answer, asks again, the app auto-listens again, and the pair loop
+            // burns a full LLM round trip per turn with the wearer saying
+            // nothing. Require at least one letter or digit to count as speech.
+            val meaningful = text != null && text.any { it.isLetterOrDigit() }
+            if (!meaningful) { failVoice(mode, error ?: "Didn't catch that"); return@transcribe }
             when (mode) {
                 VoiceMode.DICTATION -> {
                     js("window.__svInsert && window.__svInsert(${JSONObject.quote(text)})")
@@ -446,6 +673,50 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     }
 
     /**
+     * The commands a short utterance is allowed to be "nearly".
+     *
+     * Every entry is something the grammar above already handles exactly; this
+     * list only exists to rescue a mangled transcript.
+     */
+    private val CANONICAL = listOf(
+        "bookmark this page", "add bookmark", "open bookmarks",
+        "refresh", "reload", "go back", "go forward", "go home",
+        "scroll down", "scroll up", "help"
+    )
+
+    private fun editDistance(a: String, b: String): Int {
+        val prev = IntArray(b.length + 1) { it }
+        val cur = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            cur[0] = i
+            for (j in 1..b.length) {
+                val sub = prev[j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1
+                cur[j] = minOf(cur[j - 1] + 1, prev[j] + 1, sub)
+            }
+            System.arraycopy(cur, 0, prev, 0, cur.size)
+        }
+        return prev[b.length]
+    }
+
+    /**
+     * Nearest canonical command, or null if nothing is close enough.
+     *
+     * The bar is high (0.72) because a false positive silently performs the
+     * WRONG action, which is worse than falling through to the agent — the
+     * agent at least reports what it understood.
+     */
+    private fun nearestCommand(text: String): String? {
+        var best: String? = null
+        var bestSim = 0.0
+        for (c in CANONICAL) {
+            val d = editDistance(text, c)
+            val sim = 1.0 - d.toDouble() / maxOf(text.length, c.length)
+            if (sim > bestSim) { bestSim = sim; best = c }
+        }
+        return if (bestSim >= 0.72) best else null
+    }
+
+    /**
      * Spoken help. Without this, "help" was shipped to the LLM as a browsing
      * task — the one word a confused user is most likely to say was also the
      * one guaranteed not to help them.
@@ -489,7 +760,56 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             .trim()
 
     /** The voice-command grammar. Anything unmatched becomes a page-agent task. */
-    private fun routeCommand(raw: String) {
+    /** Utterance behind the current voice navigation, for the not-found retry. */
+    private var pendingVoiceNav: String? = null
+
+    private fun routeCommand(raw: String, fuzzy: Boolean = false) {
+        // Which branch claimed this utterance. Kept deliberately: the glasses
+        // have no dev tools, and "what did it think I said, and where did that
+        // go?" is the only question worth asking when a voice command misfires.
+        // One line per command, and it is the difference between diagnosing a
+        // grammar bug from a logcat and guessing.
+        fun trace(w: String) = Log.d(TAG, "ROUTE=$w")
+        // URL-shaped input is matched on the RAW text and BEFORE normalisation,
+        // which strips '.' and '/' — "go to example.com/page" would otherwise
+        // normalise to "go to example com page" and fall through to the agent
+        // as a browsing task. Found by testing, not by reading.
+        //
+        // Dictated URLs also arrive with the punctuation SPOKEN — "go to
+        // en.wikipedia.org slash wiki slash cuttlefish" — because there is no
+        // other way to say a path out loud. Untranslated, the regex fails and
+        // the command dies silently, which is the worst outcome: no navigation,
+        // no error, nothing. Try the spoken form as an ALTERNATIVE candidate
+        // rather than rewriting the input, so ordinary prose that happens to
+        // contain "dot" or "slash" is unaffected — the regex is anchored and
+        // demands a domain shape, so a real sentence still cannot match.
+        val spoken = raw.trim().lowercase()
+            .replace(Regex("\\bcolon\\s+slash\\s+slash\\b"), "://")
+            .replace(Regex("\\s+slash\\s+"), "/")
+            .replace(Regex("\\s+dot\\s+"), ".")
+            .replace(Regex("\\s+(?:dash|hyphen)\\s+"), "-")
+            .replace(Regex("\\s+underscore\\s+"), "_")
+        val urlRe = Regex(
+            "^\\s*(?:go to|goto|open|load|visit|navigate to)?\\s*((?:https?://)?(?:[a-z0-9-]+\\.)+[a-z]{2,}(?:/\\S*)?)\\s*\\.?\\s*$",
+            RegexOption.IGNORE_CASE)
+        (urlRe.find(raw.trim()) ?: urlRe.find(spoken))?.let { m ->
+            // The path is matched greedily, so a spoken sentence's final period
+            // ends up glued to the last segment (".../wiki/cuttlefish.") and 404s.
+            // Remember what was SAID, not what was parsed: if the domain turns
+            // out not to exist (a mishearing), the words are what we can still
+            // usefully search for. Spoken separators become spaces so the query
+            // reads like a phrase rather than a URL.
+            pendingVoiceNav = raw.trim()
+                .replace(Regex("^\\s*(?:go to|goto|open|load|visit|navigate to)\\s+", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\s+(?:slash|dot|dash|hyphen|underscore)\\s+", RegexOption.IGNORE_CASE), " ")
+                .trim().trimEnd('.')
+            val target = m.groupValues[1].trimEnd('.')
+                .let { if (it.startsWith("http")) it else "https://$it" }
+            trace("url")
+            showStatus("→ " + target.take(48), 2500)
+            webView.loadUrl(target)
+            return
+        }
         val text = normalizeCommand(raw)
         Log.d(TAG, "voice command: $text")
 
@@ -497,16 +817,23 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         // to fall through to the LLM — a ~60s round trip that then failed
         // anyway, because page-agent's own prompt forbids leaving the page.
         when (text) {
-            "go back", "back" -> { goBack(); return }
+            "go back", "back" -> { trace("back"); goBack(); return }
             "go forward", "forward" -> { showStatus("› Forward", 1200); webView.goForward(); return }
             "go home", "home" -> { showStatus("⌂ Home", 1500); webView.loadUrl(HOME); return }
-            "scroll down", "down" -> { scrollPage(420); return }
-            "scroll up", "up" -> { scrollPage(-420); return }
-            "top", "scroll to top" -> { webView.evaluateJavascript("scrollTo(0,0)", null); return }
-            "bottom", "scroll to bottom" -> {
-                webView.evaluateJavascript("scrollTo(0,document.body.scrollHeight)", null); return
-            }
-            "help", "what can i say", "what can you do" -> { showHelp(); return }
+            // Each of these MUST post a status, not just act. "… transcribing"
+            // is shown with autoHideMs = 0 (it has no idea how long the round
+            // trip takes), so a branch that returns silently leaves that pill
+            // on screen forever — caught on the AKC page, where the wearer is
+            // left staring at "… transcribing" over a page that did scroll.
+            "scroll down", "down" -> { trace("scrollDown"); showStatus("↓", 900); scrollPage(420); return }
+            "scroll up", "up" -> { trace("scrollUp"); showStatus("↑", 900); scrollPage(-420); return }
+            // Through the same resolver as scrollPage: scrollTo() has exactly the
+            // blind spot we just fixed — it moves the document, so on a page whose
+            // content is in an inner pane "go to the bottom" appeared to do nothing.
+            // A single huge delta saturates whichever box actually scrolls.
+            "top", "scroll to top" -> { trace("scrollTop"); showStatus("⤒ Top", 1200); scrollPage(-2_000_000); return }
+            "bottom", "scroll to bottom" -> { trace("scrollBottom"); showStatus("⤓ Bottom", 1200); scrollPage(2_000_000); return }
+            "help", "what can i say", "what can you do" -> { trace("help"); showHelp(); return }
         }
 
         // "search <q> on duckduckgo|google" — engine name tolerant of Whisper's
@@ -515,11 +842,13 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         // after normalisation ("duck duck go", "duckduck go", "ddg").
         Regex("^search (?:for )?(.+?)\\s+(?:on|in|using|with|via)\\s+(duck\\s*[,.]?\\s*duck\\s*[,.]?\\s*go|duckduckgo|ddg|google)\\b.*$")
             .find(text)?.let { m ->
+                trace("searchEngine:" + m.groupValues[1])
                 runSearch(m.groupValues[1], m.groupValues[2].startsWith("google"))
                 return
             }
         // Bare "search <q>" defaults to DuckDuckGo.
         Regex("^search (?:for )?(.+)$").find(text)?.let { m ->
+            trace("searchBare:" + m.groupValues[1])
             runSearch(m.groupValues[1], false)
             return
         }
@@ -532,6 +861,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         if (Regex("^(?:bookmark|save)(?: this| the)?(?: page)?$").matches(text) ||
             Regex("^add (?:a )?bookmark$").matches(text)
         ) {
+            trace("bookmarkAdd")
             val url = webView.url.orEmpty()
             if (url.isEmpty() || url.startsWith(INTERNAL_BASE)) {
                 showStatus("Nothing to bookmark", 2500); return
@@ -553,13 +883,14 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         }
 
         if (Regex("^(open|show) (my )?bookmarks?( manager| page)?$").matches(text)) {
-            showBookmarksPage(); return
+            trace("bookmarksPage"); showBookmarksPage(); return
         }
 
         // Anchored: "refresh my memory on this article" used to reload the page,
         // destroying scroll position and the injected agent. Bare "refresh" must
         // keep working — the app's own recovery hint tells the user to say it.
         if (Regex("^(?:refresh|reload)(?: (?:this|the) page| page)?$").matches(text)) {
+            trace("refresh")
             showStatus("⟳ Refreshing", 2000)
             webView.reload(); return
         }
@@ -604,7 +935,27 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             }
         }
 
+        // LAST RESORT before the agent: a short utterance that ALMOST matches a
+        // command is far more likely to be a misheard command than a browsing
+        // task. Whisper turned "bookmark this page" into "bunk up this page"
+        // on the real microphone — the anchored rules above are exactly right
+        // for clean text and useless against that. Found only by speaking to
+        // the device; the text-level tests all passed.
+        //
+        // Guarded hard: at most four words (so real questions and tasks, which
+        // are longer, can never be captured) and a high similarity bar.
+        if (!fuzzy && BookmarkStore.tokenize(text).size <= 4) {
+            val near = nearestCommand(text)
+            if (near != null) {
+                Log.d(TAG, "fuzzy: '$text' -> '$near'")
+                showStatus("… $near", 1800)
+                routeCommand(near, fuzzy = true)
+                return
+            }
+        }
+
         // Default: hand the request to page-agent on the current page.
+        trace("AGENT")
         sendAgentTask(raw.trim())
     }
 
@@ -854,7 +1205,15 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                   // expensive than on a desktop, where ask_user is nearly free.
                   // So: answer from the page when the page can answer, and save
                   // questions for genuine blockers.
-                  instructions: [
+                  //
+                  // MUST be { system: "..." } — page-agent reads
+                  // `instructions?.system` and does no coercion, no validation
+                  // and no warning, so a bare string is accepted and then
+                  // silently ignored. Passing the joined array directly meant
+                  // NONE of the guidance below ever reached the model; the
+                  // agent had been running with no system instructions at all,
+                  // which is why ask_user fired so freely.
+                  instructions: { system: [
                     'You are running on AR glasses. The user is hands-free and',
                     'hears your replies spoken aloud.',
                     'Prefer answering directly from the current page. Do NOT ask',
@@ -865,8 +1224,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                     'truly does not contain the answer.',
                     'If the page cannot answer, say so plainly and stop rather',
                     'than asking a follow-up question.',
-                    'Keep final answers to a few sentences: they are read aloud.'
-                  ].join(' ')
+                    'Be thorough and specific in your final answer — give the',
+                    'detail, figures and context you found, not a summary.',
+                    'A single tap stops playback, so length is not a problem.'
+                  ].join(' ') }
                 });
                 try{ if(window.pageAgent.panel && window.pageAgent.panel.hide) window.pageAgent.panel.hide(); }catch(e){}
                 // Route page-agent's ask_user tool through native voice: read the
@@ -1111,7 +1472,11 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private inner class SvBridge {
         @JavascriptInterface fun onInputFocus(value: String?) = runOnUiThread {
             // Don't pop the keyboard when page-agent is driving inputs itself.
-            if (agentVisible) return@runOnUiThread
+            // Require a LIVE task, not just a visible panel: agentVisible is
+            // sticky (it clears on a timer that any number of paths can cancel),
+            // and gating typing on it alone turned every such glitch into
+            // "the keyboard stopped working" with no way back.
+            if (agentVisible && agentRunning) return@runOnUiThread
             suppressImeFor(1800L); showKeyboard()
         }
         @JavascriptInterface fun onInputBlur() = runOnUiThread { hideSystemKeyboard() }
@@ -1123,7 +1488,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             clearAgentWatchdog()
             if (!agentVisible) return@runOnUiThread
             cancelAgentHide()
-            showStatus("🤖 " + message.take(60), 4000)
+            // Long answers are wanted, so make the exit obvious instead of
+            // shortening them: a tap already stopped playback, but nothing ever
+            // said so.
+            showStatus("🤖 " + message.take(52) + "  ·  tap to stop", 6000)
             // Task is finished: read the result, then let the panel auto-hide.
             // (No auto-relisten — that caused a run→listen→run loop. Double-tap
             // again to issue a new task; mid-task questions use onAgentAsk.)
@@ -1172,7 +1540,12 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             agentVisible = true
             cancelAgentHide()
             showStatus("Still working — say \"stop\" to cancel", 4000)
-            GroqSpeech.speak(this@MainActivity, "Still working on the previous task. Say stop to cancel.") {}
+            // Re-arm the hide: this path sets agentVisible = true and cancels the
+            // pending hide, so an empty continuation left the panel latched open
+            // (and, with it, the keyboard gate) until some other event cleared it.
+            GroqSpeech.speak(this@MainActivity, "Still working on the previous task. Say stop to cancel.") {
+                scheduleAgentHide()
+            }
         }
 
         /** page-agent fetch proxy: perform the Groq call natively (bypasses page CSP). */
@@ -1322,6 +1695,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     // ------------------------------------------------------------------
 
     private fun showStatus(text: String, autoHideMs: Long) {
+        // A multi-line pill is only ever wanted when the pill IS the message
+        // (the TTS-failure fallback); ticker updates stay one line. Deriving it
+        // from the text keeps that from leaking into the next caller.
+        statusPill.maxLines = if (text.contains('\n')) 6 else 1
         statusPill.text = text
         statusPill.visibility = View.VISIBLE
         main.removeCallbacks(statusHideRunnable)
@@ -1620,10 +1997,26 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     }
 
     override fun onDestroy() {
+        // Tear down everything that can outlive the Activity. GroqSpeech is an
+        // OBJECT — its player and callback fields are process-scoped — so a
+        // half-cleaned exit leaves the glasses talking to nobody: the agent
+        // watchdog (90s) fires after destroy and calls speak() on the static
+        // player, and onSpeechError/onSpeechFailure keep this Activity alive
+        // by holding references to it. There is no in-app way out of that;
+        // the wearer just hears the app narrating a dead session.
+        agentRunning = false
+        pendingAskId = null
+        clearAgentWatchdog()
+        main.removeCallbacksAndMessages(null)
+        GroqSpeech.onSpeechError = null
+        GroqSpeech.onSpeechFailure = null
         GroqSpeech.stopSpeaking()
         runCatching { recorder.stop() }
         runCatching { if (wakeLock.isHeld) wakeLock.release() }
         runCatching { CookieManager.getInstance().flush() }
+        // WebView must leave the hierarchy before destroy(), per its contract;
+        // destroying an attached WebView is undefined behaviour.
+        runCatching { (webView.parent as? android.view.ViewGroup)?.removeView(webView) }
         runCatching { webView.destroy() }
         super.onDestroy()
     }
