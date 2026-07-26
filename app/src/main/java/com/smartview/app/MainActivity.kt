@@ -23,6 +23,8 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
@@ -216,6 +218,54 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             @Suppress("DEPRECATION") databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             setOffscreenPreRaster(true)
+            // Darken in the ENGINE rather than with a CSS filter.
+            //
+            // The JS fallback below inverts the whole document, which is a blunt
+            // instrument: it makes <html> a containing block (breaking
+            // position:fixed headers and modals), hue-rotates brand colours into
+            // nonsense, and cannot see background-images set from a stylesheet.
+            // WebView's own darkening understands the render tree, leaves images
+            // alone and costs nothing per frame.
+            //
+            // PREFER_WEB_THEME asks for the SITE's dark theme when it declares
+            // one and only darkens algorithmically when it does not — so a page
+            // that already has a good dark design keeps it, which is the whole
+            // point on a waveguide where white is maximum projector output.
+            //
+            // Feature-checked: this device is WebView 95, which has FORCE_DARK
+            // (76+) and FORCE_DARK_STRATEGY (83+) but NOT ALGORITHMIC_DARKENING
+            // (105+), so the modern call would silently do nothing here.
+            runCatching {
+                // UA darkening ONLY, deliberately not PREFER_WEB_THEME.
+                //
+                // Preferring the web theme sounds better and is a trap here: the
+                // JS below tells pages the user prefers dark, so a site emits its
+                // dark-theme TEXT colours, while the engine — seeing a site that
+                // claims to handle dark itself — declines to darken the
+                // BACKGROUND. The two halves come from different themes and the
+                // result is black text on a black page, which is unreadable and
+                // worse than no dark mode at all.
+                //
+                // One authority for the whole page is what makes it coherent.
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
+                    WebSettingsCompat.setForceDarkStrategy(
+                        this,
+                        WebSettingsCompat.DARK_STRATEGY_USER_AGENT_DARKENING_ONLY
+                    )
+                }
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+                    @Suppress("DEPRECATION")
+                    WebSettingsCompat.setForceDark(this, WebSettingsCompat.FORCE_DARK_ON)
+                    nativeDarkening = true
+                    Log.d(TAG, "native force-dark enabled")
+                } else if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+                    WebSettingsCompat.setAlgorithmicDarkeningAllowed(this, true)
+                    nativeDarkening = true
+                    Log.d(TAG, "algorithmic darkening enabled")
+                } else {
+                    Log.w(TAG, "no native darkening on this WebView — JS fallback only")
+                }
+            }.onFailure { Log.w(TAG, "force-dark setup failed: ${it.message}") }
             loadWithOverviewMode = true
             useWideViewPort = true
             builtInZoomControls = false
@@ -882,6 +932,17 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private var retriedOpen = false
 
     /**
+     * True when the WebView itself is darkening pages.
+     *
+     * Decisive for the JS fallback: force-dark changes what is PAINTED but not
+     * what getComputedStyle REPORTS, so a darkened page still says its
+     * background is #fbfbfd. The old fallback believed that, inverted a page
+     * the engine had already darkened, and the result came out WHITE — worst
+     * on article pages, which are the ones that declare a white body.
+     */
+    private var nativeDarkening = false
+
+    /**
      * The commands a short utterance is allowed to be "nearly".
      *
      * Every entry is something the grammar above already handles exactly; this
@@ -1321,7 +1382,14 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private fun injectDarkMode() {
         val js = """
             (function(){
-              if (!window.__svDark){
+              // The engine is already darkening; our job here is only to help it
+              // pick the SITE's dark theme (the colour-scheme and matchMedia
+              // hints below). Inverting on top would undo its work.
+              var NATIVE_DARK = $nativeDarkening;
+              // With engine darkening on, telling the page it is already dark is
+              // actively harmful — it emits dark-on-dark. Only claim a dark
+              // preference when WE are the ones doing the darkening.
+              if (!window.__svDark && !NATIVE_DARK){
                 window.__svDark = true;
                 try{ ['theme','color-theme','ui-theme','ddg_theme'].forEach(function(k){ localStorage.setItem(k,'dark'); }); }catch(e){}
                 try{
@@ -1357,7 +1425,17 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                     'img,video,picture,canvas,svg,iframe,embed,object,[style*="url("],[class*="page-agent" i]{filter:invert(1) hue-rotate(180deg)!important}';
                   (document.head||document.documentElement).appendChild(s);
                 } else if(ex){ ex.remove(); } }
-              function check(){ try{ applyInvert(isLight(effBg())); }catch(e){} }
+              function check(){
+                try{
+                  if (NATIVE_DARK){ applyInvert(false); return; }
+                  var c = effBg();
+                  // Unknown background is NOT evidence of a light one. Defaulting
+                  // to "light" meant inverting pages we had simply failed to
+                  // measure — a guess that shows up as a full white screen.
+                  if (!c) return;
+                  applyInvert(isLight(c));
+                }catch(e){}
+              }
               check();
               if(!window.__svDarkTimers){ window.__svDarkTimers=true;
                 [250,800,1800].forEach(function(t){ setTimeout(check,t); }); }
