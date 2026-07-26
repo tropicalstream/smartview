@@ -1079,6 +1079,26 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             .replace(Regex("\\s+dot\\s+"), ".")
             .replace(Regex("\\s+(?:dash|hyphen)\\s+"), "-")
             .replace(Regex("\\s+underscore\\s+"), "_")
+            // "@" has no dictated spelling, so a handle URL was unreachable:
+            // "youtube.com slash at erik hartley" is the only way to say
+            // youtube.com/@ErikHartley out loud. Bound to a segment start so
+            // an ordinary "at" mid-path is left alone.
+            .replace(Regex("/at\\s+"), "/@")
+            .replace(Regex("\\s+at\\s+sign\\s+"), "@")
+            // Join the words of a dictated PATH.
+            //
+            // Speech puts spaces between path words ("/at erik hartley"), but
+            // the path pattern is /\S* — it cannot cross a space, so the whole
+            // anchored regex failed to match and the command fell through to
+            // the agent as a browsing task instead of navigating. Only
+            // whitespace AFTER a real domain+slash is removed, so ordinary
+            // prose containing "dot" or "slash" is untouched.
+            .let { s ->
+                Regex("^(\\s*(?:go to|goto|open|load|visit|navigate to)?\\s*(?:https?://)?(?:[a-z0-9-]+\\.)+[a-z]{2,})(/.*)$")
+                    .find(s)?.let { m ->
+                        m.groupValues[1] + m.groupValues[2].replace(Regex("\\s+"), "")
+                    } ?: s
+            }
         val urlRe = Regex(
             "^\\s*(?:go to|goto|open|load|visit|navigate to)?\\s*((?:https?://)?(?:[a-z0-9-]+\\.)+[a-z]{2,}(?:/\\S*)?)\\s*\\.?\\s*$",
             RegexOption.IGNORE_CASE)
