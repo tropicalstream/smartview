@@ -408,10 +408,23 @@ object GroqSpeech {
         }.onFailure { Log.w(TAG, "gemini tts failed: ${it.message}") }.getOrNull()
     }
 
+    /**
+     * Bumped by [stopSpeaking]. A speak() call captures it at entry and checks
+     * it again before playing, so a cancel that lands WHILE the audio is still
+     * being synthesised is honoured instead of being silently outrun.
+     *
+     * Without this, "stop talking" only worked if talking had already started.
+     * Measured: media detected at 22:55:36.6 and stopSpeaking() called, but the
+     * Groq round trip did not finish until 22:55:38.9 — so there was nothing to
+     * stop at the time, and five seconds of summary then played over the video.
+     */
+    @Volatile private var speakGen = 0
+
     fun speak(context: Context, text: String, onDone: () -> Unit) {
         val key = apiKey(context)
         val clipped = clipForSpeech(text)
         if (key.isEmpty() || clipped.isEmpty()) { main.post(onDone); return }
+        val myGen = ++speakGen
         Thread {
             var failure: String? = null
             // Known-exhausted: don't spend a round trip proving it again.
@@ -474,6 +487,15 @@ object GroqSpeech {
                 }
             }
             main.post {
+                // Cancelled while we were synthesising — most often because
+                // media started playing and the whole point is to not talk over
+                // it. Drop the audio on the floor, but still run onDone so no
+                // caller is left waiting on a callback that never arrives.
+                if (myGen != speakGen) {
+                    runCatching { wav?.delete() }
+                    Log.d(TAG, "tts discarded: cancelled before playback")
+                    onDone(); return@post
+                }
                 if (wav == null) {
                     // Hand the text to the UI before completing: the answer is
                     // still good, only the voice is missing.
@@ -680,6 +702,10 @@ object GroqSpeech {
      *   the settings page, or after onDestroy.
      */
     fun stopSpeaking(deliver: Boolean = false) {
+        // Invalidate anything still being synthesised as well as anything
+        // already sounding. Stopping only the player left a request in flight
+        // that would arrive moments later and start talking regardless.
+        speakGen++
         val mp = player; player = null
         val done = pendingDone; pendingDone = null
         val wav = pendingWav; pendingWav = null

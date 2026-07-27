@@ -390,6 +390,14 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 super.onPageFinished(view, url)
                 injectPolyfills()
                 injectScrollAgent()
+                // We navigated here on the wearer's behalf because they named
+                // the site. Now hand over only what is left to do. Same 1200ms
+                // grace as the hop path below: page-agent has just been
+                // injected and needs a moment before it will accept a task.
+                pendingSiteTask?.let { task ->
+                    pendingSiteTask = null
+                    main.postDelayed({ sendAgentTask(task) }, 1200)
+                }
                 if (agentResumePending) {
                     agentResumePending = false
                     agentHops++
@@ -800,6 +808,15 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
      * so the command never simply does nothing.
      */
     private fun searchInPage(query: String) {
+        // This is about to call el.focus() on the page's own search box, and a
+        // programmatic focus pops the SYSTEM IME — which on the X3 renders
+        // across both eyes at the wrong scale and cannot be dismissed by
+        // looking at it. The existing guard in onInputFocus only fires while
+        // the AGENT is driving, and an in-page search is not an agent task, so
+        // nothing was suppressing it here. We know the focus is ours, so say so
+        // before it happens rather than reacting after the keyboard is already
+        // on screen.
+        suppressImeFor(2000L)
         val js = """
             (function(q){
               function visible(el){
@@ -1299,9 +1316,71 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             }
         }
 
+        // A task that NAMES a site: go there first, then ask for the rest.
+        //
+        // The agent treats a domain in its instructions as a search term, not a
+        // destination. Watched live: "go to archive org and play Beethoven's
+        // Ninth Symphony" made it type "archive.org" into DuckDuckGo's search
+        // box, click search, and then report that the results "didn't show a
+        // direct link to play the Ninth Symphony" — it never reached the site
+        // holding the recording. Its own panel said so: "Currently on
+        // DuckDuckGo with archive.org in the search box."
+        //
+        // The destination was never ambiguous, so it should not have been the
+        // agent's problem. Load the site here and hand over only what is left —
+        // "play Beethoven's Ninth Symphony" — which is exactly the shape of task
+        // that already works.
+        siteScopedTask(raw.trim())?.let { (url, rest) ->
+            trace("siteThenAgent:$url|$rest")
+            showStatus("→ " + url.removePrefix("https://"), 2000)
+            pendingSiteTask = rest
+            webView.loadUrl(url)
+            return
+        }
+
         // Default: hand the request to page-agent on the current page.
         trace("AGENT")
         sendAgentTask(raw.trim())
+    }
+
+    /** The task to dispatch once a site-scoped navigation finishes loading. */
+    private var pendingSiteTask: String? = null
+
+    /**
+     * Split "go to <site> and <do something>" into the site and the something.
+     *
+     * Deliberately narrow. It requires an explicit navigation verb AND a
+     * connective, so ordinary prose that merely mentions a domain ("what does
+     * archive.org say about this") is left alone for the agent to handle as a
+     * question about the current page. Returns null unless both halves are real.
+     */
+    private fun siteScopedTask(text: String): Pair<String, String>? {
+        // The separator must tolerate a bare SPACE, because that is what speech
+        // actually produces: "go to archive org", with the dot dropped entirely.
+        // Requiring a dot missed the real phrasing every time.
+        //
+        // Allowing a space is only safe because the last label must be a known
+        // TLD. Without that, "go to the store and buy milk" would resolve "the
+        // store" to a hostname and navigate off to nothing.
+        val m = Regex(
+            "^(?:go to|goto|open|load|visit|navigate to)\\s+" +
+                "((?:https?://)?[a-z0-9-]+(?:(?:\\s*\\.\\s*|\\s+dot\\s+|\\s+)[a-z0-9-]+)*?" +
+                "(?:\\s*\\.\\s*|\\s+dot\\s+|\\s+)$TLDS)\\b" +
+                "\\s*,?\\s*(?:and|then)\\s+(.+)$",
+            RegexOption.IGNORE_CASE
+        ).find(text.trim()) ?: return null
+
+        // Speech renders domains with spaces and spoken dots — "archive org",
+        // "archive dot org" — neither of which is loadable as typed.
+        val host = m.groupValues[1]
+            .replace(Regex("\\s+dot\\s+", RegexOption.IGNORE_CASE), ".")
+            .replace(Regex("\\s*\\.\\s*"), ".")
+            .replace(Regex("\\s+"), ".")
+            .trimEnd('.')
+        val rest = m.groupValues[2].trim().trimEnd('.')
+        if (rest.isEmpty()) return null
+        val url = if (host.startsWith("http")) host else "https://$host"
+        return url to rest
     }
 
     // ------------------------------------------------------------------
@@ -1747,6 +1826,10 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                   }catch(e){ SvBridge.onAgentError(String((e && e.message) || e)); }
                 };
                 window.__svAgentHide = function(){ try{ window.pageAgent.panel.hide(); }catch(e){} };
+                // Hiding the panel is cosmetic — the task keeps stepping behind
+                // it. This aborts the run for real (pageAgent.stop() fires the
+                // internal AbortController), which is what stops the clicking.
+                window.__svAgentStop = function(){ try{ window.pageAgent.stop(); }catch(e){} };
                 SvBridge.onAgentReady();
               }catch(e){ SvBridge.onAgentError('init: ' + String((e && e.message) || e)); }
             })();
@@ -1822,11 +1905,35 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private fun clearAgentWatchdog() {
         agentRunning = false
         main.removeCallbacks(agentWatchdog)
+        // Every agent exit path funnels through here — done, error, closed,
+        // busy, teardown — so this covers all of them at once. But it disarms
+        // on a DELAY, because the most common way to finish a media task is to
+        // click play and report success while the player is still buffering;
+        // cutting the watch at that instant is what let the summary talk over
+        // the music.
+        disarmMediaWatchSoon()
     }
 
     private fun dispatchAgentTask(task: String, retry: Boolean, isContinuation: Boolean = false) {
         // A fresh task resets the hop budget; a continuation keeps counting.
-        if (!isContinuation) { agentTaskText = task; agentHops = 0 }
+        if (!isContinuation) {
+            agentTaskText = task; agentHops = 0
+            mediaFired = false
+        }
+        // Re-armed on EVERY dispatch, continuations included. A media task
+        // almost always crosses at least one page boundary — search, open the
+        // item, press play — and every hop runs clearAgentWatchdog(), which
+        // disarms the watch. Arming only on a fresh task therefore left the
+        // final page, the one that actually plays, completely unwatched:
+        // measured on archive.org, the watch died at 22:36:16 during hop 1,
+        // audio began at 22:36:34, and ten seconds of summary went out over
+        // the music with nothing listening.
+        //
+        // Not gated on the task looking video-ish, because "play the first
+        // file", "open that" and "what is this page about" are
+        // indistinguishable here — and a task that never starts media simply
+        // never trips it.
+        startMediaWatch()
         webView.evaluateJavascript("(typeof window.__svAgentTask==='function')") { r ->
             when {
                 r == "true" -> {
@@ -1857,6 +1964,208 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         armAgentWatchdog()
         pendingAskId = null
         js("window.__svAnswer && window.__svAnswer(${JSONObject.quote(id)}, ${JSONObject.quote(text)})")
+    }
+
+    // ------------------------------------------------------------------
+    //  "The media started" — detected below the web, where origins do not exist
+    // ------------------------------------------------------------------
+    //
+    // The agent cannot tell that a video it opened is playing. DuckDuckGo (and
+    // most search results, and every embed) plays inside a CROSS-ORIGIN iframe,
+    // and the agent is forbidden from reading it — logcat shows the attempt
+    // failing over and over: "Unable to access iframe: [object DOMException]".
+    // So every observation still looks like the search page, the agent concludes
+    // it failed, and it clicks again. Observed live: it opened the right video,
+    // then clicked four more times, then navigated away and finally reported
+    // "I was unable to open the second video to start playback" -- while the
+    // video had been playing the entire time.
+    //
+    // Listening for HTML 'play'/'playing' events does not fix this, which is
+    // why two previous attempts did not work: cross-origin iframes do not
+    // propagate media events to the parent document, so the listener never
+    // fires for exactly the case that needs it.
+    //
+    // Android sees what the web layer cannot. Chromium requests audio focus for
+    // WebView media as USAGE_MEDIA/CONTENT_TYPE_MUSIC, so isMusicActive() goes
+    // true for ANY playing frame regardless of origin. That is the signal.
+
+    private var mediaWatchActive = false
+    private var mediaFired = false
+    private var mediaCallbackRegistered = false
+
+    private val audioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+    }
+
+    /**
+     * The primary detector, and the reason polling alone was not enough.
+     *
+     * isMusicActive() only goes true once PCM is actually flowing, which lags
+     * the start of playback by seconds while the player buffers. Measured on
+     * archive.org: audio focus was granted at 22:31:42.6, the agent finished at
+     * 22:31:45.0, and the watch was torn down before isMusicActive() ever
+     * returned true — so the summary played over the music anyway. The video
+     * case only passed because the agent happened to flail for eleven seconds,
+     * which is luck, not design.
+     *
+     * This fires when a player is CREATED, which is early enough, and it
+     * carries each player's attributes — so our own speech can be told apart
+     * from page media by content type rather than by guessing. That matters:
+     * the old `!isSpeaking` guard silenced the detector during the summary,
+     * which is precisely when it is needed.
+     */
+    private val playbackCallback = object : android.media.AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<android.media.AudioPlaybackConfiguration>?) {
+            if (!mediaWatchActive || configs == null) return
+            val pageMedia = configs.any {
+                it.audioAttributes.contentType == android.media.AudioAttributes.CONTENT_TYPE_MUSIC
+            }
+            // A player APPEARING is not a track playing. Pages emit brief
+            // transient sounds while loading — measured on archive.org: focus
+            // taken at 22:44:51.390 and abandoned at 22:44:51.524, all of 134ms,
+            // which fired this and silenced everything six seconds before the
+            // real track even began. So arm a confirmation instead of believing
+            // it, and require the sound to still be there shortly afterwards.
+            if (pageMedia) main.post { armMediaConfirm() }
+        }
+    }
+
+    /** Backstop only. Some players report late or not at all through the callback. */
+    private val mediaWatch = object : Runnable {
+        override fun run() {
+            if (!mediaWatchActive) return
+            if (audioManager.isMusicActive && !GroqSpeech.isSpeaking) {
+                armMediaConfirm()
+                return
+            }
+            main.postDelayed(this, MEDIA_POLL_MS)
+        }
+    }
+
+    private var mediaConfirmArmed = false
+
+    /**
+     * Something started making noise. Wait, then check it is STILL making noise.
+     *
+     * This is the difference between a track and a blip. Loading pages fire
+     * short transient sounds that take audio focus and drop it inside a couple
+     * of hundred milliseconds; acting on those silenced the app before the
+     * agent had even reached the play button.
+     */
+    private fun armMediaConfirm() {
+        if (mediaFired || mediaConfirmArmed) return
+        mediaConfirmArmed = true
+        main.postDelayed({
+            mediaConfirmArmed = false
+            if (mediaFired || !mediaWatchActive) return@postDelayed
+            // Still sounding after the settle window: a real track, not a blip.
+            if (audioManager.isMusicActive && !GroqSpeech.isSpeaking) {
+                onMediaConfirmed()
+            } else {
+                // It was a blip. Go back to watching rather than giving up —
+                // the real playback is usually still to come.
+                main.removeCallbacks(mediaWatch)
+                main.postDelayed(mediaWatch, MEDIA_POLL_MS)
+            }
+        }, MEDIA_SETTLE_MS)
+    }
+
+    private fun startMediaWatch() {
+        // Deliberately does NOT clear mediaFired: this is re-entered on every
+        // continuation, and resetting it there would let one already-handled
+        // playback be "detected" a second time.
+        stopMediaWatch()
+        main.removeCallbacks(disarmMediaWatch)
+        mediaWatchActive = true
+        if (!mediaCallbackRegistered) {
+            runCatching { audioManager.registerAudioPlaybackCallback(playbackCallback, main) }
+                .onSuccess { mediaCallbackRegistered = true }
+        }
+        main.postDelayed(mediaWatch, MEDIA_POLL_MS)
+    }
+
+    private fun stopMediaWatch() {
+        mediaWatchActive = false
+        mediaConfirmArmed = false
+        main.removeCallbacks(mediaWatch)
+        if (mediaCallbackRegistered) {
+            runCatching { audioManager.unregisterAudioPlaybackCallback(playbackCallback) }
+            mediaCallbackRegistered = false
+        }
+    }
+
+    /**
+     * Keep watching for a few seconds after the task ends.
+     *
+     * An agent that clicks play and immediately reports success is the COMMON
+     * case, not an edge one — and the media it started is still buffering when
+     * it does. Disarming the instant the task finished is what let the
+     * archive.org summary talk straight over the music.
+     */
+    private fun disarmMediaWatchSoon() {
+        if (!mediaWatchActive) return
+        main.removeCallbacks(disarmMediaWatch)
+        main.postDelayed(disarmMediaWatch, MEDIA_GRACE_AFTER_DONE_MS)
+    }
+
+    private val disarmMediaWatch = Runnable { stopMediaWatch() }
+
+    /**
+     * Media is genuinely playing. The task is done whether or not the agent
+     * believes it — so end it, get out of the way, and say so briefly.
+     */
+    /**
+     * Media is playing. GET QUIET — but do NOT stop the agent.
+     *
+     * Stopping it here was wrong, and wrong in a way that broke the actual
+     * request. Media starting is not the same thing as the task being finished:
+     * archive.org item pages autoplay the moment they load, so the first sound
+     * arrives while the agent is still one click away from the track that was
+     * actually asked for. Measured: audio focus at 22:40:03.9, the agent killed
+     * at 22:40:04.2, and the item page only finished loading at 22:40:05.0 —
+     * the first song never got played, because the fix beat the agent to it.
+     *
+     * What the wearer complained about is being TALKED OVER, so that is all
+     * this does: silence the narration, drop the panel, show a small pill. The
+     * agent keeps working and can go press play on the right thing.
+     */
+    private fun onMediaConfirmed() {
+        if (mediaFired) return
+        mediaFired = true
+        Log.d(TAG, "media playing — going quiet (agent continues)")
+        GroqSpeech.stopSpeaking()
+        cancelAgentHide()
+        hideAgentPanel()
+        showStatus("▶ Playing", MEDIA_NOTICE_MS)
+        // The runaway case still needs an answer. If the agent is STILL going a
+        // while after media started, it is not finishing a job — it is the
+        // cross-origin blindness loop, re-clicking because it cannot see the
+        // playback it caused. Give it room to finish honestly first, and only
+        // cut it off once the looping is the likelier explanation.
+        main.removeCallbacks(loopBreaker)
+        main.postDelayed(loopBreaker, MEDIA_LOOP_GRACE_MS)
+    }
+
+    /**
+     * Last resort for the case that started all this: media playing, agent
+     * still clicking. Only reached if the task did not end on its own.
+     */
+    private val loopBreaker = Runnable {
+        // Liveness is the TASK, not agentRunning. Every navigation sets
+        // agentRunning = false and lets the resume path bring it back, so a
+        // looping agent — which by definition keeps moving between pages —
+        // reads as "not running" most of the time. Gating on it made this a
+        // no-op in exactly the case it exists for. agentTaskText survives the
+        // hops, because the intent does.
+        if (agentTaskText == null && !agentRunning) return@Runnable
+        Log.d(TAG, "agent still stepping over playing media — stopping it")
+        webView.evaluateJavascript("window.__svAgentStop && window.__svAgentStop()", null)
+        agentTaskText = null
+        agentHops = 0
+        agentResumePending = false
+        clearAgentWatchdog()
+        GroqSpeech.stopSpeaking()
+        hideAgentPanel()
     }
 
     private fun scheduleAgentHide() {
@@ -1902,6 +2211,14 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             clearAgentWatchdog()
             if (!agentVisible) return@runOnUiThread
             cancelAgentHide()
+            if (mediaFired) {
+                // Media is already playing and the pill has said so. Reading a
+                // paragraph about it now would be talking over the very thing
+                // the user asked to hear — better to say nothing at all than to
+                // start and be cut off a word later.
+                hideAgentPanel()
+                return@runOnUiThread
+            }
             // Long answers are wanted, so make the exit obvious instead of
             // shortening them: a tap already stopped playback, but nothing ever
             // said so.
@@ -2447,6 +2764,33 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         private const val INTERNAL_BASE = "https://smartview.internal/"
         private const val MAX_RECORD_MS = 8000L
         private const val AGENT_HIDE_MS = 5000L
+        /** How often to ask Android whether media is playing, while a task runs. */
+        private const val MEDIA_POLL_MS = 350L
+        /**
+         * How long a sound must persist before it counts as playback rather
+         * than a loading blip. Measured false positive: a transient that took
+         * audio focus and abandoned it 134ms later.
+         */
+        private const val MEDIA_SETTLE_MS = 1500L
+        /** The brief "it worked" pill that replaces the panel and the monologue. */
+        private const val MEDIA_NOTICE_MS = 2000L
+        /** How long after a task ends a starting player still counts as its doing. */
+        private const val MEDIA_GRACE_AFTER_DONE_MS = 12_000L
+        /**
+         * How long the agent may keep working after media starts before it is
+         * treated as the cross-origin blindness loop rather than honest work.
+         * Generous on purpose: cutting a task short is worse than a few extra
+         * clicks, because it means the thing the wearer asked for never happens.
+         */
+        private const val MEDIA_LOOP_GRACE_MS = 20_000L
+
+        /**
+         * Endings that may follow a spoken domain. This list is what makes it
+         * safe to accept a bare space as the separator, so "archive org" works
+         * while "the store" is left alone.
+         */
+        private const val TLDS =
+            "(?:com|org|net|io|edu|gov|tv|fm|me|info|app|dev|ai|co\\.uk|co)"
         private const val KEYBOARD_HIDE_MS = 10000L
         // Current mobile-Chrome UA to satisfy Cloudflare (real engine is Chrome 95).
         private const val MODERN_UA =
